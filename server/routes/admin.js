@@ -372,4 +372,74 @@ router.delete('/turfs/:id/bookings', verifyToken, verifyAdmin, async (req, res) 
   }
 });
 
+// GET /api/admin/payouts - Get daily payouts status for all turfs
+router.get('/payouts', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    // Get commission percentage
+    const [settings] = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'commission_percent'");
+    const commission = settings.length > 0 ? parseFloat(settings[0].setting_value) : 10;
+
+    // We want to fetch daily earnings for all turfs for the last 30 days
+    const query = `
+      SELECT 
+        DATE(b.booking_date) as date,
+        t.id as turf_id,
+        t.name as turf_name,
+        o.name as owner_name,
+        COALESCE(SUM(b.amount), 0) as total_earnings,
+        COALESCE(SUM((COALESCE(b.original_price, b.amount) - COALESCE(b.discount_amount, 0)) * (? / 100)), 0) as commission_amount,
+        COALESCE(SUM((COALESCE(b.original_price, b.amount) - COALESCE(b.discount_amount, 0)) * ((100 - ?) / 100)), 0) as owner_payout,
+        COALESCE(dp.status, 'not_paid') as status,
+        dp.paid_at
+      FROM bookings b
+      JOIN turfs t ON b.turf_id = t.id
+      JOIN owners o ON t.owner_id = o.id
+      LEFT JOIN daily_payouts dp ON dp.turf_id = t.id AND dp.payout_date = DATE(b.booking_date)
+      WHERE b.status = 'confirmed' AND b.payment_status = 'success' 
+        AND b.booking_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+      GROUP BY DATE(b.booking_date), t.id, t.name, o.name, dp.status, dp.paid_at
+      ORDER BY DATE(b.booking_date) DESC, t.name ASC
+    `;
+    
+    const [rows] = await pool.query(query, [commission, commission]);
+    
+    res.json({ payouts: rows });
+  } catch (err) {
+    console.error('Error fetching payouts:', err);
+    res.status(500).json({ error: 'Failed to fetch payouts' });
+  }
+});
+
+// POST /api/admin/payouts/mark-paid - Mark a specific day for a turf as paid
+router.post('/payouts/mark-paid', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { turf_id, date, status } = req.body;
+    
+    if (!turf_id || !date || !status) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    if (status === 'paid') {
+      await pool.query(
+        `INSERT INTO daily_payouts (turf_id, payout_date, status, paid_at) 
+         VALUES (?, ?, 'paid', CURRENT_TIMESTAMP)
+         ON DUPLICATE KEY UPDATE status = 'paid', paid_at = CURRENT_TIMESTAMP`,
+        [turf_id, date]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO daily_payouts (turf_id, payout_date, status, paid_at) 
+         VALUES (?, ?, 'not_paid', NULL)
+         ON DUPLICATE KEY UPDATE status = 'not_paid', paid_at = NULL`,
+        [turf_id, date]
+      );
+    }
+    
+    res.json({ success: true, message: 'Payout status updated' });
+  } catch (err) {
+    console.error('Error updating payout status:', err);
+    res.status(500).json({ error: 'Failed to update payout status' });
+  }
+});
+
 module.exports = router;

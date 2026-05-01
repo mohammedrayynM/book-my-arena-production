@@ -108,8 +108,8 @@ router.post('/turfs', verifyToken, verifyOwner, async (req, res) => {
   try {
     const { name, location, address, sport_type, price_per_hour, description, images, amenities, open_time, close_time, markup_type, markup_value, latitude, longitude } = req.body;
 
-    if (!name || !location || !sport_type || !price_per_hour) {
-      return res.status(400).json({ error: 'Name, location, sport type, and price are required' });
+    if (!name || !location || !sport_type || !price_per_hour || !latitude || !longitude) {
+      return res.status(400).json({ error: 'Name, location, sport type, price, latitude, and longitude are required' });
     }
 
     // Generate unique slug
@@ -126,7 +126,7 @@ router.post('/turfs', verifyToken, verifyOwner, async (req, res) => {
     const [result] = await pool.query(
       `INSERT INTO turfs (name, location, address, sport_type, price_per_hour, description, images, amenities, owner_id, open_time, close_time, markup_type, markup_value, slug, latitude, longitude)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [name, location, address || '', sport_type, price_per_hour, description || '', JSON.stringify(images || []), JSON.stringify(amenities || []), req.user.id, open_time || '06:00', close_time || '23:00', markup_type || 'fixed', markup_value || 0, slug, latitude || 13.0827, longitude || 80.2707]
+      [name, location, address || '', sport_type, price_per_hour, description || '', JSON.stringify(images || []), JSON.stringify(amenities || []), req.user.id, open_time || '06:00', close_time || '23:00', markup_type || 'fixed', markup_value || 0, slug, latitude, longitude]
     );
 
     res.json({ success: true, turf_id: result.insertId, slug });
@@ -147,6 +147,10 @@ router.put('/turfs/:id', verifyToken, verifyOwner, async (req, res) => {
 
     const { name, location, address, sport_type, price_per_hour, description, images, amenities, is_active, open_time, close_time, markup_type, markup_value, latitude, longitude } = req.body;
 
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: 'Latitude and longitude are required' });
+    }
+
     // Optional: Update slug if name changes
     const baseSlug = name.toLowerCase().trim().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-');
     const locationSlug = location.toLowerCase().trim().replace(/[^a-z0-9]/g, '-');
@@ -156,7 +160,7 @@ router.put('/turfs/:id', verifyToken, verifyOwner, async (req, res) => {
     await pool.query(
       `UPDATE turfs SET name = ?, location = ?, address = ?, sport_type = ?, price_per_hour = ?, description = ?, images = ?, amenities = ?, is_active = ?, open_time = ?, close_time = ?, markup_type = ?, markup_value = ?, slug = ?, latitude = ?, longitude = ?
        WHERE id = ? AND owner_id = ?`,
-      [name, location, address, sport_type, price_per_hour, description, JSON.stringify(images || []), JSON.stringify(amenities || []), is_active !== false, open_time || '06:00', close_time || '23:00', markup_type || 'fixed', markup_value || 0, slug, latitude || 13.0827, longitude || 80.2707, req.params.id, req.user.id]
+      [name, location, address, sport_type, price_per_hour, description, JSON.stringify(images || []), JSON.stringify(amenities || []), is_active !== false, open_time || '06:00', close_time || '23:00', markup_type || 'fixed', markup_value || 0, slug, latitude, longitude, req.params.id, req.user.id]
     );
 
     res.json({ success: true, message: 'Turf updated successfully', slug });
@@ -455,13 +459,17 @@ router.get('/earnings', verifyToken, verifyOwner, async (req, res) => {
 
     // Daily breakdown for the current month
     const [dailyStats] = await pool.query(
-      `SELECT DATE(booking_date) as date, 
-              COALESCE(SUM((original_price - discount_amount) * ((100 - ?) / 100)), 0) as earnings
-       FROM bookings b JOIN turfs t ON b.turf_id = t.id
+      `SELECT DATE(b.booking_date) as date, 
+              COALESCE(SUM((COALESCE(b.original_price, b.amount) - COALESCE(b.discount_amount, 0)) * ((100 - ?) / 100)), 0) as earnings,
+              COALESCE(dp.status, 'not_paid') as status,
+              dp.paid_at
+       FROM bookings b 
+       JOIN turfs t ON b.turf_id = t.id
+       LEFT JOIN daily_payouts dp ON dp.turf_id = t.id AND dp.payout_date = DATE(b.booking_date)
        WHERE t.owner_id = ? AND b.status = 'confirmed' AND b.payment_status = 'success'
-       AND MONTH(booking_date) = MONTH(CURDATE()) AND YEAR(booking_date) = YEAR(CURDATE())
-       GROUP BY DATE(booking_date)
-       ORDER BY DATE(booking_date) ASC`,
+       AND MONTH(b.booking_date) = MONTH(CURDATE()) AND YEAR(b.booking_date) = YEAR(CURDATE())
+       GROUP BY DATE(b.booking_date), dp.status, dp.paid_at
+       ORDER BY DATE(b.booking_date) ASC`,
       [commission, req.user.id]
     );
 
@@ -471,7 +479,9 @@ router.get('/earnings', verifyToken, verifyOwner, async (req, res) => {
       monthly: parseFloat(monthlyResult[0].total),
       daily: dailyStats.map(d => ({
         date: d.date,
-        earnings: parseFloat(d.earnings)
+        earnings: parseFloat(d.earnings),
+        status: d.status,
+        paid_at: d.paid_at
       }))
     });
   } catch (err) {
