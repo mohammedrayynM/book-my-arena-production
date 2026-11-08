@@ -1,9 +1,28 @@
 const nodemailer = require('nodemailer');
 require('dotenv').config();
 
-const sendEmail = async (toEmail, subject, text, html) => {
+const sendEmail = async (toEmail, subject, text, html, options = {}) => {
   const user = process.env.EMAIL_USER;
   const pass = process.env.EMAIL_PASS;
+
+  const toKey = String(toEmail || '').trim().toLowerCase();
+  const shouldSuppressAdminRecipients = options?.suppressAdminRecipients === true;
+
+  if (shouldSuppressAdminRecipients) {
+    const suppressed = new Set(
+      String(process.env.SUPPRESS_EMAILS_TO || '')
+        .split(',')
+        .map(s => String(s || '').trim().toLowerCase())
+        .filter(Boolean)
+    );
+    if (user) suppressed.add(String(user).trim().toLowerCase());
+    if (process.env.ADMIN_EMAIL) suppressed.add(String(process.env.ADMIN_EMAIL).trim().toLowerCase());
+
+    if (toKey && suppressed.has(toKey)) {
+      console.log(`⚠️ Email suppressed for ${toEmail}`);
+      return { success: false, message: 'Recipient suppressed' };
+    }
+  }
 
   if (!user || user === 'your_email@gmail.com' || !pass || pass === 'your_app_password_here') {
     console.warn('⚠️ Email credentials not configured. Skipping Email.');
