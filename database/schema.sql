@@ -59,12 +59,14 @@ CREATE TABLE IF NOT EXISTS bookings (
 CREATE TABLE IF NOT EXISTS blocked_slots (
   id INT AUTO_INCREMENT PRIMARY KEY,
   turf_id INT NOT NULL,
+  court_id INT DEFAULT NULL,
   block_date DATE NOT NULL,
   time_slot VARCHAR(50) NOT NULL,
   reason VARCHAR(255),
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (turf_id) REFERENCES turfs(id) ON DELETE CASCADE
 );
+CREATE INDEX idx_blocked_slots_turf_court_date ON blocked_slots(turf_id, court_id, block_date);
 
 -- Platform Settings table
 CREATE TABLE IF NOT EXISTS settings (

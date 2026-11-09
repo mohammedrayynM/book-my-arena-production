@@ -41,6 +41,43 @@ async function migrate() {
       }
     }
 
+    // Find Players feature tables (idempotent)
+    try {
+      console.log('🏃 Ensuring Find Players tables...');
+      await connection.query(`
+        CREATE TABLE IF NOT EXISTS player_availability (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          user_id INT NOT NULL,
+          sport_type VARCHAR(50) NOT NULL,
+          turf_id INT,
+          preferred_location VARCHAR(300),
+          availability_start TIME NOT NULL,
+          availability_end TIME NOT NULL,
+          availability_date DATE NOT NULL,
+          role VARCHAR(50),
+          skill_level ENUM('beginner', 'intermediate', 'advanced', 'all') DEFAULT 'all',
+          status ENUM('active', 'expired', 'cancelled') DEFAULT 'active',
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX (user_id),
+          INDEX (status),
+          INDEX (availability_date),
+          INDEX (sport_type)
+        );
+
+        CREATE TABLE IF NOT EXISTS player_invites (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          match_id INT NOT NULL,
+          availability_id INT NOT NULL,
+          status ENUM('pending', 'accepted', 'declined') DEFAULT 'pending',
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+      console.log('✅ Find Players tables ensured.');
+    } catch (err) {
+      console.error('❌ Find Players tables migration failed:', err.message);
+    }
+
     // Additional manual fixes for bookings table just in case migrate-special-pricing missed it
     try {
         console.log('🔧 Verifying bookings table columns...');
@@ -64,6 +101,29 @@ async function migrate() {
                 console.log(`✅ Added column ${col}`);
             } catch (e) {
                 console.log(`ℹ️ Column ${col} might already exist`);
+            }
+        }
+    }
+
+    // Ensure court_id support in blocked slots and special pricing tables
+    try {
+        console.log('🔧 Verifying blocked_slots and special_pricing table columns...');
+        await connection.query(`
+            ALTER TABLE blocked_slots ADD COLUMN IF NOT EXISTS court_id INT DEFAULT NULL;
+            ALTER TABLE special_pricing ADD COLUMN IF NOT EXISTS court_id INT DEFAULT NULL;
+        `);
+        console.log('✅ blocked_slots and special_pricing court_id columns verified.');
+    } catch (err) {
+        const tableCols = [
+            ['blocked_slots', 'court_id', 'INT DEFAULT NULL'],
+            ['special_pricing', 'court_id', 'INT DEFAULT NULL']
+        ];
+        for (const [table, col, def] of tableCols) {
+            try {
+                await connection.query(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+                console.log(`✅ Added ${table}.${col}`);
+            } catch (e) {
+                console.log(`ℹ️ Column ${table}.${col} might already exist`);
             }
         }
     }

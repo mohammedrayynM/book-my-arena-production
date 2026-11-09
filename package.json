@@ -1,7 +1,14 @@
 {
+  "scripts": {
+    "test": "node ./server/tests/slot-utils.test.js",
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js"
+  },
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
+    "expo": "^57.0.9",
     "express": "^5.2.1",
     "mysql2": "^3.22.2"
   }

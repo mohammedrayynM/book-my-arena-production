@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Turf Image Upload - Owner Panel Example</title>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-default: #0f172a;
+            --bg-surface: #1e293b;
+            --bg-card: #334155;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --primary: #10b981;
+            --primary-hover: #059669;
+            --border-subtle: #334155;
+            --radius-md: 8px;
+            --radius-lg: 12px;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            background-color: var(--bg-default);
+            color: var(--text-primary);
+            line-height: 1.5;
+            padding: 40px 20px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        header {
+            margin-bottom: 32px;
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 2rem;
+            font-weight: 800;
+            margin-bottom: 8px;
+        }
+
+        p.subtitle {
+            color: var(--text-secondary);
+        }
+
+        .card {
+            background: var(--bg-surface);
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--border-subtle);
+            padding: 32px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+        }
+
+        .form-section {
+            margin-bottom: 24px;
+        }
+
+        label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 8px;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .upload-area {
+            border: 2px dashed var(--border-subtle);
+            border-radius: var(--radius-md);
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            background: var(--bg-default);
+            position: relative;
+        }
+
+        .upload-area:hover, .upload-area.dragover {
+            border-color: var(--primary);
+            background: rgba(16, 185, 129, 0.05);
+        }
+
+        .upload-icon {
+            font-size: 2.5rem;
+            margin-bottom: 12px;
+            display: block;
+        }
+
+        .upload-text {
+            font-weight: 600;
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        .upload-hint {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        .image-preview-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            gap: 16px;
+            margin-top: 24px;
+        }
+
+        .image-item {
+            position: relative;
+            aspect-ratio: 16/10;
+            border-radius: var(--radius-md);
+            overflow: hidden;
+            border: 1px solid var(--border-subtle);
+            background: var(--bg-card);
+        }
+
+        .image-item img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .remove-img {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            background: rgba(239, 68, 68, 0.9);
+            color: white;
+            border: none;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            font-weight: bold;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            transition: 0.2s;
+        }
+
+        .remove-img:hover {
+            background: #ef4444;
+            transform: scale(1.1);
+        }
+
+        .img-type-badge {
+            position: absolute;
+            bottom: 8px;
+            left: 8px;
+            background: rgba(0,0,0,0.6);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 10px;
+            text-transform: uppercase;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+        }
+
+        .progress-container {
+            margin-top: 12px;
+            height: 6px;
+            background: var(--bg-default);
+            border-radius: 3px;
+            overflow: hidden;
+            display: none;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: var(--primary);
+            width: 0%;
+            transition: width 0.3s;
+        }
+
+        .url-input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        input[type="text"] {
+            flex: 1;
+            background: var(--bg-default);
+            border: 1px solid var(--border-subtle);
+            color: var(--text-primary);
+            padding: 10px 14px;
+            border-radius: var(--radius-md);
+            outline: none;
+        }
+
+        input[type="text"]:focus {
+            border-color: var(--primary);
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border-radius: var(--radius-md);
+            font-weight: 600;
+            cursor: pointer;
+            transition: 0.2s;
+            border: none;
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: var(--primary-hover);
+        }
+
+        .alert {
+            padding: 12px;
+            border-radius: var(--radius-md);
+            margin-bottom: 20px;
+            display: none;
+            font-size: 0.9rem;
+        }
+
+        .alert-error {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid #ef4444;
+            color: #ef4444;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1>Turf Media Management</h1>
+        <p class="subtitle">Upload photos of your turf or add external image URLs</p>
+    </header>
+
+    <div class="card">
+        <div id="errorAlert" class="alert alert-error"></div>
+
+        <!-- URL Input Section -->
+        <div class="form-section">
+            <label>Add External Image URL</label>
+            <div class="url-input-group">
+                <input type="text" id="imageUrlInput" placeholder="https://example.com/image.jpg">
+                <button class="btn btn-primary" onclick="addUrlImage()">Add URL</button>
+            </div>
+        </div>
+
+        <div style="display: flex; align-items: center; gap: 10px; margin: 30px 0;">
+            <div style="flex: 1; height: 1px; background: var(--border-subtle);"></div>
+            <span style="color: var(--text-muted); font-size: 0.7rem; font-weight: 800;">OR UPLOAD FILES</span>
+            <div style="flex: 1; height: 1px; background: var(--border-subtle);"></div>
+        </div>
+
+        <!-- File Upload Section -->
+        <div class="form-section">
+            <label>Upload Images from Device</label>
+            <div class="upload-area" id="dropZone">
+                <span class="upload-icon">📸</span>
+                <span class="upload-text">Click or drag images here</span>
+                <span class="upload-hint">Supports JPEG, PNG, WebP (Max 5MB)</span>
+                <input type="file" id="fileInput" accept="image/jpeg,image/png,image/webp" multiple>
+            </div>
+            
+            <div class="progress-container" id="progressContainer">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+        </div>
+
+        <!-- Preview Section -->
+        <div class="form-section">
+            <label>Turf Gallery (<span id="imageCount">0</span> images)</label>
+            <div class="image-preview-grid" id="previewGrid">
+                <!-- Previews will appear here -->
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // Configuration
+    const API_BASE = 'http://localhost:5000/api';
+    const TURF_ID = '123'; // Example ID
+    const AUTH_TOKEN = localStorage.getItem('userToken') || 'YOUR_TOKEN_HERE';
+
+    // State
+    let images = [];
+
+    // DOM Elements
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+    const previewGrid = document.getElementById('previewGrid');
+    const progressBar = document.getElementById('progressBar');
+    const progressContainer = document.getElementById('progressContainer');
+    const errorAlert = document.getElementById('errorAlert');
+    const imageCount = document.getElementById('imageCount');
+
+    // Event Listeners
+    dropZone.onclick = () => fileInput.click();
+    fileInput.onchange = (e) => handleFileUpload(e.target.files);
+
+    dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add('dragover'); };
+    dropZone.ondragleave = () => dropZone.classList.remove('dragover');
+    dropZone.ondrop = (e) => {
+        e.preventDefault();
+        dropZone.classList.remove('dragover');
+        handleFileUpload(e.dataTransfer.files);
+    };
+
+    async function handleFileUpload(files) {
+        if (!files.length) return;
+        
+        errorAlert.style.display = 'none';
+        progressContainer.style.display = 'block';
+        let completed = 0;
+
+        for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            const formData = new FormData();
+            formData.append('image', file);
+
+            try {
+                const res = await fetch(`${API_BASE}/owners/turfs/${TURF_ID}/upload-image`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                    body: formData
+                });
+
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || 'Upload failed');
+
+                images.push({ ...data.image, type: 'upload' });
+                renderGallery();
+            } catch (err) {
+                showError(err.message);
+            } finally {
+                completed++;
+                progressBar.style.width = `${(completed / files.length) * 100}%`;
+            }
+        }
+
+        setTimeout(() => {
+            progressContainer.style.display = 'none';
+            progressBar.style.width = '0%';
+        }, 1000);
+    }
+
+    function addUrlImage() {
+        const urlInput = document.getElementById('imageUrlInput');
+        const url = urlInput.value.trim();
+        if (!url) return;
+
+        images.push({ url, type: 'url' });
+        urlInput.value = '';
+        renderGallery();
+    }
+
+    async function removeImage(index) {
+        const img = images[index];
+        if (img.type === 'upload') {
+            try {
+                const res = await fetch(`${API_BASE}/owners/turfs/${TURF_ID}/remove-image`, {
+                    method: 'DELETE',
+                    headers: { 
+                        'Authorization': `Bearer ${AUTH_TOKEN}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ filename: img.filename })
+                });
+                if (!res.ok) console.error('Failed to remove from server');
+            } catch (err) { console.error(err); }
+        }
+        
+        images.splice(index, 1);
+        renderGallery();
+    }
+
+    function renderGallery() {
+        previewGrid.innerHTML = '';
+        imageCount.innerText = images.length;
+
+        images.forEach((img, idx) => {
+            const div = document.createElement('div');
+            div.className = 'image-item';
+            
+            const displayUrl = img.url.startsWith('http') ? img.url : `http://localhost:5000${img.url}`;
+            
+            div.innerHTML = `
+                <img src="${displayUrl}" alt="Preview">
+                <button class="remove-img" onclick="removeImage(${idx})">&times;</button>
+                <span class="img-type-badge">${img.type}</span>
+            `;
+            previewGrid.appendChild(div);
+        });
+    }
+
+    function showError(msg) {
+        errorAlert.innerText = msg;
+        errorAlert.style.display = 'block';
+    }
+</script>
+
+</body>
+</html>

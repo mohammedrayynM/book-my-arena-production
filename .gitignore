@@ -1,8 +1,33 @@
 node_modules/
 .next/
-dist/
 build/
 .env
 .env.local
 .DS_Store
 *.log
+*.err
+*.zip
+*.apk
+*.txt
+
+# Ignore root dist but keep client/dist (production build)
+/dist/
+
+# Ignore scratch/temp files
+scratch/
+.expo/
+.vscode/
+lifelink/
+out.txt
+ngrok.txt
+
+# Ignore mobile (separate deployment)
+mobile/
+
+# Ignore deploy artifacts
+deploy-bookmyarena.zip
+server.zip
+
+# Keep these (force include)
+!client/dist/
+!ec2-deploy.sh
