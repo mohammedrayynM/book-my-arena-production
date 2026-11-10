@@ -303,17 +303,22 @@ const allowedOrigins = new Set([
   'http://127.0.0.1:5173',
   'http://localhost:4173',
   'http://127.0.0.1:4173',
+  'http://bookarena.in',
   'https://bookarena.in',
-  'https://www.bookarena.in'
+  'http://www.bookarena.in',
+  'https://www.bookarena.in',
+  'http://3.27.94.251',
+  'https://3.27.94.251'
 ].filter(Boolean));
 
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.has(origin)) {
-      callback(null, true);
-      return;
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.has(origin) || origin.endsWith('bookarena.in')) {
+      return callback(null, true);
     }
-    callback(new Error(`CORS blocked for origin: ${origin}`));
+    // Allow request without CORS headers instead of throwing 500 error
+    callback(null, false);
   },
   credentials: true
 }));
