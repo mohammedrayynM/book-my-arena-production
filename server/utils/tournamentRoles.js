@@ -3,6 +3,8 @@ const ROLES_BY_SPORT = {
   football: ['PLAYER', 'GOALKEEPER', 'DEFENDER', 'MIDFIELDER', 'FORWARD'],
   basketball: ['PLAYER', 'POINT_GUARD', 'SHOOTING_GUARD', 'SMALL_FORWARD', 'POWER_FORWARD', 'CENTER'],
   volleyball: ['PLAYER', 'SETTER', 'LIBERO', 'OUTSIDE_HITTER', 'OPPOSITE', 'MIDDLE_BLOCKER'],
+  badminton: ['PLAYER', 'SINGLES', 'DOUBLES'],
+  tennis: ['PLAYER', 'SINGLES', 'DOUBLES'],
 };
 
 function isCricketSport(sport) {

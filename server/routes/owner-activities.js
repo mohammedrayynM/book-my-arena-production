@@ -95,16 +95,28 @@ router.post('/', verifyToken, verifyOwner, async (req, res) => {
 
 // Single-segment GET routes declared before /:id — otherwise Express would treat them as an activity id.
 router.get('/today', verifyToken, verifyOwner, async (req, res) => {
-  // 'today' is the server's local calendar day, not the DB's (UTC) CURDATE(): they differ for the first 5.5h of an IST day
-  const where = ["b.owner_id = ?", "b.booking_date = ?", "b.status = 'confirmed'"]; const params = [req.user.id, reports.ymd(new Date())];
-  if (req.query.activity_id) { where.push('b.activity_id = ?'); params.push(req.query.activity_id); }
-  const [[stats]] = await pool.query(`SELECT COUNT(*) AS bookings, COALESCE(SUM(b.total_amount),0) AS revenue FROM activity_bookings b WHERE ${where.join(' AND ')}`, params);
-  const [[tix]] = await pool.query(
-    `SELECT COALESCE(SUM(t.quantity_covered),0) AS tickets, COALESCE(SUM(t.redeemed_quantity),0) AS entries
-     FROM activity_tickets t JOIN activity_bookings b ON b.id = t.booking_id WHERE ${where.join(' AND ')}`, params
-  );
-  const currencies = await reports.ownerCurrencies(req.user.id, req.query.activity_id ? Number(req.query.activity_id) : null);
-  res.json({ success: true, currency: currencies[0] || 'INR', bookings: stats.bookings, revenue: Number(stats.revenue), tickets: Number(tix.tickets), entries: Number(tix.entries) });
+  try {
+    // 'today' is the server's local calendar day, not the DB's (UTC) CURDATE(): they differ for the first 5.5h of an IST day
+    const where = ["b.owner_id = ?", "b.booking_date = ?", "b.status = 'confirmed'"]; const params = [req.user.id, reports.ymd(new Date())];
+    if (req.query.activity_id) { where.push('b.activity_id = ?'); params.push(req.query.activity_id); }
+    const [[stats]] = await pool.query(`SELECT COUNT(*) AS bookings, COALESCE(SUM(b.total_amount),0) AS revenue FROM activity_bookings b WHERE ${where.join(' AND ')}`, params);
+    const [[tix]] = await pool.query(
+      `SELECT COALESCE(SUM(t.quantity_covered),0) AS tickets, COALESCE(SUM(t.redeemed_quantity),0) AS entries
+       FROM activity_tickets t JOIN activity_bookings b ON b.id = t.booking_id WHERE ${where.join(' AND ')}`, params
+    );
+    const currencies = await reports.ownerCurrencies(req.user.id, req.query.activity_id ? Number(req.query.activity_id) : null);
+    res.json({
+      success: true,
+      currency: (currencies && currencies[0]) || 'INR',
+      bookings: (stats && stats.bookings) || 0,
+      revenue: Number((stats && stats.revenue) || 0),
+      tickets: Number((tix && tix.tickets) || 0),
+      entries: Number((tix && tix.entries) || 0)
+    });
+  } catch (e) {
+    console.error('owner activities today stats error:', e.message);
+    res.json({ success: true, currency: 'INR', bookings: 0, revenue: 0, tickets: 0, entries: 0 });
+  }
 });
 // ---- single/two-segment routes: all declared before /:id so they are never mistaken for an activity id ----
 router.get('/analytics', verifyToken, verifyOwner, async (req, res) => {

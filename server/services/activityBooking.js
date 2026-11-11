@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const pool = require('../config/db');
 const Razorpay = require('razorpay');
 const globalConfig = require('./globalConfig');
+const billingConfig = require('./billingConfig');
 const { toMinor } = require('../utils/money');
 require('dotenv').config();
 
@@ -207,8 +208,31 @@ async function calculatePrice({ activityId, bookingDate, items, addons = [], off
   if (taxPercent === null) return { error: 'The tax configuration is invalid. Please contact the venue.' };
   const taxable = round2(subtotal + addonAmount - discountAmount);
   const taxAmount = round2(taxable * taxPercent / 100);
-  const total = round2(taxable + taxAmount);
-  return { activity, lineItems, addonItems, subtotal, addonAmount, discountAmount, taxAmount, total, offer, weekend };
+
+  let serviceFee = 0;
+  let serviceFeeTax = 0;
+  let showFeeAtCheckout = true;
+  let feeRuleId = null;
+  let feeRuleSnapshot = null;
+
+  try {
+    const activeFeeRule = await billingConfig.getActiveFeeRule(activity.country_code || 'IN', activity.currency_code || 'INR', 'ACTIVITY');
+    const feeCalc = billingConfig.calculateCustomerFee(activeFeeRule, taxable + taxAmount);
+    serviceFee = feeCalc.serviceFee;
+    serviceFeeTax = feeCalc.serviceFeeTax;
+    showFeeAtCheckout = feeCalc.showFeeAtCheckout;
+    feeRuleId = feeCalc.feeRuleId;
+    feeRuleSnapshot = feeCalc.feeRuleSnapshot;
+  } catch (feeErr) {
+    console.error('[activityBooking] Error calculating customer fee:', feeErr);
+  }
+
+  const total = round2(taxable + taxAmount + serviceFee + serviceFeeTax);
+  return { 
+    activity, lineItems, addonItems, subtotal, addonAmount, discountAmount, taxAmount, 
+    serviceFee, serviceFeeTax, totalCustomerFee: round2(serviceFee + serviceFeeTax), showFeeAtCheckout, feeRuleId, feeRuleSnapshot,
+    total, offer, weekend 
+  };
 }
 
 /** Creates the pending booking + a Razorpay order for the authoritative total. No ticket exists yet. */
@@ -244,10 +268,11 @@ async function createPendingBooking({ activityId, bookingDate, timeWindowId, ite
     orderId = order.id;
   }
 
+  const { serviceFee = 0, serviceFeeTax = 0, feeRuleId = null, feeRuleSnapshot = null } = priced;
   const [ins] = await pool.query(
-    `INSERT INTO activity_bookings (booking_code, activity_id, owner_id, user_id, customer_name, customer_phone, customer_email, booking_date, time_window_id, status, payment_status, razorpay_order_id, subtotal_amount, discount_amount, addon_amount, tax_amount, total_amount, offer_id)
-     VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?, ?, ?, ?, ?, ?, ?)`,
-    [activityId, activity.owner_id, customer.userId || null, customer.name || null, customer.phone || null, customer.email || null, bookingDate, timeWindowId || null, orderId, subtotal, discountAmount, addonAmount, taxAmount, total, offer ? offer.id : null]
+    `INSERT INTO activity_bookings (booking_code, activity_id, owner_id, user_id, customer_name, customer_phone, customer_email, booking_date, time_window_id, status, payment_status, razorpay_order_id, subtotal_amount, discount_amount, addon_amount, tax_amount, total_amount, offer_id, service_fee, service_fee_tax, fee_rule_id, fee_rule_snapshot)
+     VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [activityId, activity.owner_id, customer.userId || null, customer.name || null, customer.phone || null, customer.email || null, bookingDate, timeWindowId || null, orderId, subtotal, discountAmount, addonAmount, taxAmount, total, offer ? offer.id : null, serviceFee, serviceFeeTax, feeRuleId, feeRuleSnapshot]
   );
   const bookingId = ins.insertId;
   await pool.query('UPDATE activity_bookings SET booking_code = ? WHERE id = ?', [genBookingCode(bookingId), bookingId]);

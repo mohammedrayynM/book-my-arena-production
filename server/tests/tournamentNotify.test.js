@@ -32,7 +32,7 @@ const idsOf = (people) => people.map((p) => p.id).sort((a, b) => a - b);
 
 test.before(async () => {
   await db.setup();
-  await qq('CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100), email VARCHAR(150), karma_points INT DEFAULT 0, phone VARCHAR(20) NULL)');
+  await qq('CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100), email VARCHAR(150), karma_points INT DEFAULT 0, phone VARCHAR(20) NULL, profile_pic VARCHAR(500) NULL)');
   for (const c of ['latitude DOUBLE NULL', 'longitude DOUBLE NULL', 'sport_type VARCHAR(40) NULL', 'location VARCHAR(100) NULL']) await qq(`ALTER TABLE turfs ADD COLUMN ${c}`);
   for (const c of ['user_id INT NULL', 'sport_type VARCHAR(40) NULL']) await qq(`ALTER TABLE bookings ADD COLUMN ${c}`);
   await require('../migrate_tournaments')();

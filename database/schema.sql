@@ -75,9 +75,9 @@ CREATE TABLE IF NOT EXISTS settings (
   setting_value TEXT NOT NULL
 );
 
--- Insert default admin (password: admin123)
+-- Insert default admin (password: mr0962)
 INSERT INTO admins (username, password_hash) VALUES
-('admin', '$2a$10$xVqYLGEeT5o9MaJ5P3yOaOxLnVMCh5JZ1ZqP5X5X5X5X5X5X5X5X5');
+('admin', '$2b$10$wN375n68a/V39/p/p4/lRe3gWknx/J0a8K9oQ9eW7b6Zl3s2G/0qy');
 
 -- Insert default commission setting (10%)
 INSERT INTO settings (setting_key, setting_value) VALUES

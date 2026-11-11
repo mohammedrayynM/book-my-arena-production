@@ -107,8 +107,15 @@ function replay(events, { oversLimit = null, wicketsLimit = 10 } = {}) {
 
   for (const e of balls) {
     const m = metaOf(e);
-    const inningsNo = Math.max(1, parseInt(m.innings, 10) || 1);
-    const inn = inningsOf(inningsNo);
+    let inningsNo = Math.max(1, parseInt(m.innings, 10) || 1);
+    let inn = inningsOf(inningsNo);
+
+    // If an event has a team_id different from the existing batting_team_id of this innings,
+    // it belongs to the next innings (teams cannot bat in the same innings).
+    if (inn.batting_team_id != null && e.team_id != null && Number(e.team_id) !== Number(inn.batting_team_id)) {
+      inningsNo = inningsNo + 1;
+      inn = inningsOf(inningsNo);
+    }
 
     if (inn.batting_team_id == null && e.team_id != null) inn.batting_team_id = Number(e.team_id);
     if (inn.bowling_team_id == null && m.bowling_team_id != null) inn.bowling_team_id = Number(m.bowling_team_id);

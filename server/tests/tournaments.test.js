@@ -43,7 +43,7 @@ const create = (tokenId, extra = {}) => request(app).post('/api/tournaments').se
 
 test.before(async () => {
   await db.setup();
-  await qq('CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100), email VARCHAR(150), karma_points INT DEFAULT 0, phone VARCHAR(20) NULL)');
+  await qq('CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100), email VARCHAR(150), karma_points INT DEFAULT 0, phone VARCHAR(20) NULL, profile_pic VARCHAR(500) NULL)');
   await qq('ALTER TABLE admins ADD COLUMN name VARCHAR(100) NULL');
   await require('../migrate_tournaments')();
   for (const m of ['migrate_tournament_registrations', 'migrate_sponsors', 'migrate_tournament_plans',

@@ -185,50 +185,186 @@ router.get('/overview', async (req, res) => {
 // ------------------------------------------------------------------------------------------------------------------
 router.get('/turfs', async (req, res) => {
   try {
-    const q = String(req.query.q || '').trim();
-    const where = []; const params = [];
-    if (q) { where.push('(t.name LIKE ? OR o.name LIKE ? OR t.sport_type LIKE ? OR t.id = ?)'); params.push(`%${q}%`, `%${q}%`, `%${q}%`, Number(q) || 0); }
-    if (req.query.model) { where.push('h.billing_model = ?'); params.push(String(req.query.model)); }
-    if (req.query.status) { where.push(`CASE
-      WHEN c.id IS NULL AND h.billing_model = 'SUBSCRIPTION' THEN 'NOT_OPENED'
-      WHEN c.id IS NULL THEN 'NOT_APPLICABLE'
-      WHEN GREATEST(c.amount_minor - c.paid_separately_minor - COALESCE(ded.deducted_minor, 0), 0) = 0 THEN 'PAID'
-      WHEN DATEDIFF(CURDATE(), c.cycle_start) > COALESCE(h.grace_period_days, 0) THEN 'OVERDUE'
-      ELSE 'PAYMENT_DUE' END = ?`); params.push(String(req.query.status).toUpperCase()); }
-    // TiDB does not support subqueries inside ON clauses. Use a derived table with ROW_NUMBER() to
-    // pick the latest effective billing config per turf, then LEFT JOIN the result.
-    const [rows] = await pool.query(
-      `SELECT t.id, t.name, t.sport_type, t.approval_status, t.country_code, COALESCE(t.currency_code,'INR') AS currency, o.id AS owner_id, o.name AS owner_name,
-              t.route_enabled, t.route_status, t.route_linked_account_id, t.route_environment,
-              COALESCE(h.billing_model, CASE WHEN t.route_commission_type = 'subscription' OR t.billing_model = 'MONTHLY' THEN 'SUBSCRIPTION' WHEN t.route_commission_type = 'flat' THEN 'FLAT' WHEN t.route_commission_type = 'percentage' OR t.route_split_percentage IS NOT NULL OR t.commission_percentage IS NOT NULL THEN 'PERCENTAGE' ELSE NULL END) AS billing_model,
-              h.version AS config_version, h.commission_bps, h.flat_fee_minor, h.subscription_amount_minor, h.subscription_period, h.subscription_policy, h.grace_period_days,
-              c.id AS current_cycle_id, c.cycle_start, c.cycle_end, c.currency AS cycle_currency, c.amount_minor AS cycle_amount_minor,
-              c.paid_separately_minor, COALESCE(ded.deducted_minor, 0) AS deducted_minor,
-              GREATEST(c.amount_minor - c.paid_separately_minor - COALESCE(ded.deducted_minor, 0), 0) AS outstanding_minor,
-              CASE
-                WHEN c.id IS NULL AND h.billing_model = 'SUBSCRIPTION' THEN 'NOT_OPENED'
-                WHEN c.id IS NULL THEN 'NOT_APPLICABLE'
-                WHEN GREATEST(c.amount_minor - c.paid_separately_minor - COALESCE(ded.deducted_minor, 0), 0) = 0 THEN 'PAID'
-                WHEN DATEDIFF(CURDATE(), c.cycle_start) > COALESCE(h.grace_period_days, 0) THEN 'OVERDUE'
-                ELSE 'PAYMENT_DUE' END AS billing_status,
-              CASE WHEN h.id IS NOT NULL THEN 0 WHEN t.route_commission_type = 'subscription' OR t.billing_model = 'MONTHLY' THEN (t.monthly_subscription_amount IS NULL OR t.monthly_subscription_amount <= 0 OR t.subscription_start_date IS NULL) WHEN t.route_commission_type = 'flat' THEN (t.route_flat_amount IS NULL OR t.route_flat_amount < 0) WHEN t.route_commission_type = 'percentage' OR t.route_split_percentage IS NOT NULL OR t.commission_percentage IS NOT NULL THEN (COALESCE(t.route_split_percentage, t.commission_percentage) IS NULL OR COALESCE(t.route_split_percentage, t.commission_percentage) < 0 OR COALESCE(t.route_split_percentage, t.commission_percentage) > 100) ELSE 1 END AS billing_configuration_error
-       FROM turfs t LEFT JOIN owners o ON o.id = t.owner_id
-       LEFT JOIN (
-         SELECT id, turf_id, billing_model, version,
-                ROW_NUMBER() OVER (PARTITION BY turf_id ORDER BY effective_from DESC, id DESC) AS rn
-         FROM turf_billing_config_history
-         WHERE effective_from <= NOW()
-       ) h ON h.turf_id = t.id AND h.rn = 1
-       LEFT JOIN (
-         SELECT c0.*, ROW_NUMBER() OVER (PARTITION BY c0.turf_id ORDER BY c0.cycle_start DESC, c0.id DESC) AS rn
-         FROM turf_subscription_cycles c0 WHERE c0.cycle_start <= CURDATE() AND c0.cycle_end >= CURDATE()
-       ) c ON c.turf_id = t.id AND c.rn = 1
-       LEFT JOIN (
-         SELECT cycle_id, SUM(amount_minor) AS deducted_minor
-         FROM turf_subscription_deductions WHERE reversed_at IS NULL GROUP BY cycle_id
-       ) ded ON ded.cycle_id = c.id
-       ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY t.name ASC LIMIT 500`, params);
-    res.json({ success: true, turfs: rows });
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const modelFilter = req.query.model ? String(req.query.model).toUpperCase() : null;
+    const statusFilter = req.query.status ? String(req.query.status).toUpperCase() : null;
+    const typeFilter = req.query.type ? String(req.query.type).toUpperCase() : 'ALL'; // ALL, SPORTS, ACTIVITY
+
+    const venues = [];
+
+    // 1. Fetch Sports Venues (turfs)
+    if (typeFilter === 'ALL' || typeFilter === 'SPORTS') {
+      const [turfRows] = await pool.query(`
+        SELECT 
+          t.id, t.name, t.sport_type, t.approval_status, t.country_code, 
+          COALESCE(t.currency_code, 'INR') AS currency,
+          o.id AS owner_id, o.name AS owner_name, o.email AS owner_email,
+          t.route_enabled, t.route_status, t.route_linked_account_id, t.route_environment,
+          t.route_commission_type, t.route_split_percentage, t.route_flat_amount,
+          t.commission_percentage, t.monthly_subscription_amount, t.subscription_start_date,
+          t.billing_model AS turf_billing_model, 'SPORTS' AS venue_type
+        FROM turfs t
+        LEFT JOIN owners o ON o.id = t.owner_id
+        WHERE (t.is_deleted = 0 OR t.is_deleted IS NULL)
+        ORDER BY t.name ASC
+        LIMIT 500
+      `);
+      venues.push(...turfRows);
+    }
+
+    // 2. Fetch Amusement Parks (activities)
+    if (typeFilter === 'ALL' || typeFilter === 'ACTIVITY') {
+      const [actRows] = await pool.query(`
+        SELECT 
+          a.id, a.name, 'Amusement Park' AS sport_type,
+          CASE WHEN a.status = 'approved' OR a.status = 'active' THEN 'APPROVED' 
+               WHEN a.status = 'pending' THEN 'PENDING' 
+               ELSE UPPER(a.status) END AS approval_status,
+          COALESCE(a.country_code, 'IN') AS country_code,
+          COALESCE(a.currency_code, 'INR') AS currency,
+          o.id AS owner_id, o.name AS owner_name, o.email AS owner_email,
+          0 AS route_enabled, 'not_configured' AS route_status, NULL AS route_linked_account_id, 'test' AS route_environment,
+          'percentage' AS route_commission_type, a.commission_percent AS route_split_percentage, NULL AS route_flat_amount,
+          a.commission_percent AS commission_percentage, NULL AS monthly_subscription_amount, NULL AS subscription_start_date,
+          'PERCENTAGE' AS turf_billing_model, 'ACTIVITY' AS venue_type
+        FROM activities a
+        LEFT JOIN owners o ON o.id = a.owner_id
+        WHERE (a.status IS NULL OR a.status != 'deleted')
+        ORDER BY a.name ASC
+        LIMIT 500
+      `);
+      venues.push(...actRows);
+    }
+
+    // 3. Batch load billing config history for all venues
+    const turfIds = venues.filter(v => v.venue_type === 'SPORTS').map(v => v.id);
+    const configsByTurf = {};
+    if (turfIds.length > 0) {
+      const [histories] = await pool.query(`
+        SELECT h.*
+        FROM turf_billing_config_history h
+        INNER JOIN (
+          SELECT turf_id, MAX(id) AS max_id
+          FROM turf_billing_config_history
+          WHERE effective_from <= NOW()
+          GROUP BY turf_id
+        ) latest ON h.id = latest.max_id
+      `);
+      for (const h of histories) {
+        configsByTurf[h.turf_id] = h;
+      }
+    }
+
+    // 4. Batch load current subscription cycles
+    const cyclesByTurf = {};
+    if (turfIds.length > 0) {
+      const [cycles] = await pool.query(`
+        SELECT c.*, COALESCE(ded.deducted_minor, 0) AS deducted_minor
+        FROM turf_subscription_cycles c
+        INNER JOIN (
+          SELECT turf_id, MAX(id) AS max_id
+          FROM turf_subscription_cycles
+          WHERE cycle_start <= CURDATE() AND cycle_end >= CURDATE()
+          GROUP BY turf_id
+        ) latest_c ON c.id = latest_c.max_id
+        LEFT JOIN (
+          SELECT cycle_id, SUM(amount_minor) AS deducted_minor
+          FROM turf_subscription_deductions 
+          WHERE reversed_at IS NULL 
+          GROUP BY cycle_id
+        ) ded ON ded.cycle_id = c.id
+      `);
+      for (const c of cycles) {
+        cyclesByTurf[c.turf_id] = c;
+      }
+    }
+
+    // 5. Enrich venues
+    let results = venues.map(t => {
+      const h = configsByTurf[t.id] || null;
+      const c = cyclesByTurf[t.id] || null;
+
+      let billing_model = h?.billing_model;
+      if (!billing_model) {
+        if (t.route_commission_type === 'subscription' || t.turf_billing_model === 'MONTHLY') billing_model = 'SUBSCRIPTION';
+        else if (t.route_commission_type === 'flat') billing_model = 'FLAT';
+        else if (t.route_commission_type === 'percentage' || t.route_split_percentage != null || t.commission_percentage != null) billing_model = 'PERCENTAGE';
+        else billing_model = 'PERCENTAGE';
+      }
+
+      let billing_status = 'NOT_APPLICABLE';
+      let outstanding_minor = 0;
+      if (billing_model === 'SUBSCRIPTION') {
+        if (!c) {
+          billing_status = 'NOT_OPENED';
+        } else {
+          outstanding_minor = Math.max(0, (c.amount_minor || 0) - (c.paid_separately_minor || 0) - (c.deducted_minor || 0));
+          if (outstanding_minor === 0) {
+            billing_status = 'PAID';
+          } else {
+            const graceDays = h?.grace_period_days ?? 3;
+            const cycleStart = new Date(c.cycle_start);
+            const now = new Date();
+            const diffDays = Math.floor((now - cycleStart) / (1000 * 60 * 60 * 24));
+            billing_status = diffDays > graceDays ? 'OVERDUE' : 'PAYMENT_DUE';
+          }
+        }
+      }
+
+      return {
+        id: t.id,
+        name: t.name,
+        sport_type: t.sport_type,
+        approval_status: t.approval_status,
+        country_code: t.country_code,
+        currency: t.currency,
+        owner_id: t.owner_id,
+        owner_name: t.owner_name || 'N/A',
+        owner_email: t.owner_email || '',
+        route_enabled: t.route_enabled || 0,
+        route_status: t.route_status || 'not_configured',
+        route_linked_account_id: t.route_linked_account_id,
+        route_environment: t.route_environment || 'test',
+        billing_model,
+        config_version: h?.version || null,
+        commission_bps: h?.commission_bps != null ? h.commission_bps : (t.route_split_percentage != null ? Math.round(t.route_split_percentage * 100) : (t.commission_percentage != null ? Math.round(t.commission_percentage * 100) : 500)),
+        flat_fee_minor: h?.flat_fee_minor != null ? h.flat_fee_minor : (t.route_flat_amount != null ? Math.round(t.route_flat_amount * 100) : null),
+        subscription_amount_minor: h?.subscription_amount_minor != null ? h.subscription_amount_minor : (t.monthly_subscription_amount != null ? Math.round(t.monthly_subscription_amount * 100) : 80000),
+        subscription_period: h?.subscription_period || 'MONTHLY',
+        subscription_policy: h?.subscription_policy || 'SEPARATE',
+        grace_period_days: h?.grace_period_days ?? 3,
+        current_cycle_id: c?.id || null,
+        cycle_start: c?.cycle_start || null,
+        cycle_end: c?.cycle_end || null,
+        cycle_currency: c?.currency || t.currency,
+        cycle_amount_minor: c?.amount_minor || 0,
+        paid_separately_minor: c?.paid_separately_minor || 0,
+        deducted_minor: c?.deducted_minor || 0,
+        outstanding_minor,
+        billing_status,
+        venue_type: t.venue_type
+      };
+    });
+
+    // 6. Apply search and model/status filters
+    if (q) {
+      results = results.filter(r => 
+        String(r.name || '').toLowerCase().includes(q) ||
+        String(r.owner_name || '').toLowerCase().includes(q) ||
+        String(r.sport_type || '').toLowerCase().includes(q) ||
+        String(r.id) === q
+      );
+    }
+
+    if (modelFilter) {
+      results = results.filter(r => r.billing_model === modelFilter);
+    }
+
+    if (statusFilter) {
+      results = results.filter(r => r.billing_status === statusFilter);
+    }
+
+    res.json({ success: true, turfs: results });
   } catch (e) { handleError(res, e, 'Could not load venues'); }
 });
 
@@ -241,9 +377,15 @@ router.get('/ledger', async (req, res) => {
               WHEN t.route_commission_type = 'percentage' OR t.route_split_percentage IS NOT NULL OR t.commission_percentage IS NOT NULL THEN 'PERCENTAGE'
               ELSE 'UNCONFIGURED' END) AS billing_model, COUNT(*) AS venues
        FROM turfs t LEFT JOIN (
-         SELECT turf_id, billing_model, ROW_NUMBER() OVER (PARTITION BY turf_id ORDER BY effective_from DESC, id DESC) AS rn
-         FROM turf_billing_config_history WHERE effective_from <= NOW()
-       ) h ON h.turf_id = t.id AND h.rn = 1
+         SELECT h0.turf_id, h0.billing_model
+         FROM turf_billing_config_history h0
+         INNER JOIN (
+           SELECT turf_id, MAX(id) AS max_id
+           FROM turf_billing_config_history
+           WHERE effective_from <= NOW()
+           GROUP BY turf_id
+         ) latest ON h0.id = latest.max_id
+       ) h ON h.turf_id = t.id
        GROUP BY billing_model`
     );
     const [cycles] = await pool.query(
@@ -604,6 +746,33 @@ router.post('/turfs/:id/subscription/cycles/:cycleId/record-payment', async (req
 // ------------------------------------------------------------------------------------------------------------------
 // Customer fee / tax rules
 // ------------------------------------------------------------------------------------------------------------------
+// PATCH /fee-rules/:id/toggle - Toggle active status of a fee rule
+router.patch('/fee-rules/:id/toggle', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const [[rule]] = await pool.query('SELECT * FROM platform_fee_rules WHERE id = ?', [id]);
+    if (!rule) return bad(res, 404, 'Fee rule not found');
+    const newStatus = rule.is_active ? 0 : 1;
+    await pool.query('UPDATE platform_fee_rules SET is_active = ? WHERE id = ?', [newStatus, id]);
+    res.json({ success: true, id, is_active: newStatus === 1 });
+  } catch (e) { handleError(res, e, 'Could not toggle fee rule status'); }
+});
+
+router.put('/fee-rules/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const b = req.body || {};
+    const [[rule]] = await pool.query('SELECT * FROM platform_fee_rules WHERE id = ?', [id]);
+    if (!rule) return bad(res, 404, 'Fee rule not found');
+    const applyTo = b.apply_to || rule.apply_to || 'ALL';
+    const showFee = b.show_fee_at_checkout !== undefined ? (b.show_fee_at_checkout ? 1 : 0) : rule.show_fee_at_checkout;
+    const isActive = b.is_active !== undefined ? (b.is_active ? 1 : 0) : rule.is_active;
+    await pool.query('UPDATE platform_fee_rules SET apply_to = ?, show_fee_at_checkout = ?, is_active = ? WHERE id = ?', [applyTo, showFee, isActive, id]);
+    const [[updated]] = await pool.query('SELECT * FROM platform_fee_rules WHERE id = ?', [id]);
+    res.json({ success: true, rule: updated });
+  } catch (e) { handleError(res, e, 'Could not update fee rule'); }
+});
+
 router.get('/fee-rules', async (req, res) => {
   try { res.json({ success: true, rules: await billing.listFeeRules() }); } catch (e) { handleError(res, e, 'Could not load fee rules'); }
 });

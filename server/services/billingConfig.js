@@ -266,14 +266,92 @@ async function subscriptionOverview(turf, config) {
 // ---------------------------------------------------------------------------------------------------------------
 // Customer fee / tax rules (central, per country + currency)
 // ---------------------------------------------------------------------------------------------------------------
-async function getActiveFeeRule(countryCode, currencyCode, asOf = new Date(), conn = pool) {
-  const [[r]] = await conn.query(
-    `SELECT * FROM platform_fee_rules WHERE country_code = ? AND currency_code = ? AND effective_from <= ? ORDER BY effective_from DESC, id DESC LIMIT 1`,
-    [String(countryCode || 'IN').toUpperCase(), String(currencyCode || 'INR').toUpperCase(), asOf]
+async function getActiveFeeRule(countryCode, currencyCode, sectionType = 'ALL', asOf = new Date(), conn = pool) {
+  const cCode = String(countryCode || 'IN').toUpperCase();
+  const currCode = String(currencyCode || 'INR').toUpperCase();
+  const sec = String(sectionType || 'ALL').toUpperCase();
+
+  const [rows] = await conn.query(
+    `SELECT * FROM platform_fee_rules 
+     WHERE country_code = ? AND currency_code = ? AND is_active = 1 AND effective_from <= ?
+       AND (apply_to = 'ALL' OR apply_to = ? OR apply_to IS NULL)
+     ORDER BY (apply_to = ?) DESC, effective_from DESC, id DESC LIMIT 1`,
+    [cCode, currCode, asOf, sec, sec]
   );
+  const r = rows[0];
   if (!r) return null;
   const n = (v) => (v === null || v === undefined ? null : Number(v));
-  return { ...r, fee_fixed_minor: n(r.fee_fixed_minor), fee_bps: n(r.fee_bps), tax_bps: n(r.tax_bps), tax_inclusive: !!r.tax_inclusive };
+  return {
+    ...r,
+    fee_fixed_minor: n(r.fee_fixed_minor),
+    fee_bps: n(r.fee_bps),
+    tax_bps: n(r.tax_bps),
+    tax_inclusive: !!r.tax_inclusive,
+    apply_to: r.apply_to || 'ALL',
+    show_fee_at_checkout: r.show_fee_at_checkout !== 0,
+    is_active: r.is_active !== 0
+  };
+}
+
+/**
+ * Calculates customer fee and tax from a fee rule and pre-fee amount.
+ * Returns amounts in major currency units (e.g. Rupees).
+ */
+function calculateCustomerFee(rule, amountMajor) {
+  const base = Math.max(0, Number(amountMajor || 0));
+  if (!rule || rule.fee_type === 'NONE' || rule.is_active === false) {
+    return {
+      serviceFee: 0,
+      serviceFeeTax: 0,
+      totalCustomerFee: 0,
+      totalPayable: base,
+      showFeeAtCheckout: true,
+      feeRuleId: null,
+      feeRuleSnapshot: null
+    };
+  }
+
+  let fee = 0;
+  if (rule.fee_type === 'FIXED') {
+    // fee_fixed_minor is in minor currency units (paise/cents)
+    fee = (Number(rule.fee_fixed_minor) || 0) / 100;
+  } else if (rule.fee_type === 'PERCENT') {
+    // fee_bps in basis points (100 bps = 1%)
+    fee = (base * (Number(rule.fee_bps) || 0)) / 10000;
+  }
+  fee = Math.round(fee * 100) / 100;
+
+  let tax = 0;
+  if (rule.tax_bps && fee > 0) {
+    tax = (fee * Number(rule.tax_bps)) / 10000;
+    tax = Math.round(tax * 100) / 100;
+  }
+
+  const showFee = rule.show_fee_at_checkout !== 0 && rule.show_fee_at_checkout !== false;
+  const totalCustomerFee = Math.round((fee + tax) * 100) / 100;
+  const totalPayable = Math.round((base + totalCustomerFee) * 100) / 100;
+
+  const snapshot = {
+    id: rule.id,
+    fee_type: rule.fee_type,
+    fee_fixed_minor: rule.fee_fixed_minor,
+    fee_bps: rule.fee_bps,
+    tax_bps: rule.tax_bps,
+    tax_inclusive: rule.tax_inclusive,
+    apply_to: rule.apply_to || 'ALL',
+    show_fee_at_checkout: showFee,
+    calculated_at: new Date().toISOString()
+  };
+
+  return {
+    serviceFee: fee,
+    serviceFeeTax: tax,
+    totalCustomerFee,
+    totalPayable,
+    showFeeAtCheckout: showFee,
+    feeRuleId: rule.id,
+    feeRuleSnapshot: JSON.stringify(snapshot)
+  };
 }
 
 async function publishFeeRule({ countryCode, currencyCode, input, adminId }) {
@@ -299,10 +377,17 @@ async function publishFeeRule({ countryCode, currencyCode, input, adminId }) {
     if (effectiveFrom.getTime() < Date.now()) effectiveFrom = new Date();
   }
   if (!has(input.note) || String(input.note).trim().length < 3) throw new pricing.PricingConfigError('A note is required for every fee/tax change');
+  const applyTo = ['ALL', 'VENUE', 'ACTIVITY'].includes(String(input.apply_to || '').toUpperCase()) 
+    ? String(input.apply_to).toUpperCase() 
+    : 'ALL';
+  const showFeeAtCheckout = input.show_fee_at_checkout === false || input.show_fee_at_checkout === 0 ? 0 : 1;
+  const isActive = input.is_active === false || input.is_active === 0 ? 0 : 1;
+
   const [ins] = await pool.query(
-    `INSERT INTO platform_fee_rules (country_code, currency_code, fee_type, fee_fixed_minor, fee_bps, tax_bps, tax_inclusive, refund_fee_policy, coupon_applies_before_fee, effective_from, created_by, note)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [country, currency, rule.fee_type, rule.fee_fixed_minor, rule.fee_bps, rule.tax_bps, rule.tax_inclusive, refundPolicy, input.coupon_applies_before_fee === false ? 0 : 1, effectiveFrom, adminId || null, String(input.note).trim().slice(0, 500)]
+    `INSERT INTO platform_fee_rules 
+      (country_code, currency_code, fee_type, fee_fixed_minor, fee_bps, tax_bps, tax_inclusive, refund_fee_policy, coupon_applies_before_fee, effective_from, created_by, note, apply_to, show_fee_at_checkout, is_active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [country, currency, rule.fee_type, rule.fee_fixed_minor, rule.fee_bps, rule.tax_bps, rule.tax_inclusive, refundPolicy, input.coupon_applies_before_fee === false ? 0 : 1, effectiveFrom, adminId || null, String(input.note).trim().slice(0, 500), applyTo, showFeeAtCheckout, isActive]
   );
   const [[row]] = await pool.query('SELECT * FROM platform_fee_rules WHERE id = ?', [ins.insertId]);
   return row;
@@ -316,5 +401,5 @@ async function listFeeRules() {
 module.exports = {
   ymdToday, minorDigitsFor, legacyConfigFromTurf, getEffectiveConfig, validateForSettlement, listHistory, buildConfigFromInput, publishConfig,
   ensureCycle, cycleTotals, refreshCycleStatus, subscriptionOverview,
-  getActiveFeeRule, publishFeeRule, listFeeRules,
+  getActiveFeeRule, calculateCustomerFee, publishFeeRule, listFeeRules,
 };

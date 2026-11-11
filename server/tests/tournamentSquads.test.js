@@ -23,7 +23,7 @@ const DATES = { start_date: '2099-03-01', end_date: '2099-03-02' };
 
 test.before(async () => {
   await db.setup();
-  await qq('CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100), email VARCHAR(150), karma_points INT DEFAULT 0, phone VARCHAR(20) NULL)');
+  await qq('CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100), email VARCHAR(150), karma_points INT DEFAULT 0, phone VARCHAR(20) NULL, profile_pic VARCHAR(500) NULL)');
   await require('../migrate_tournaments')();
   for (const m of ['migrate_tournament_host_type', 'migrate_tournament_venue', 'migrate_tournament_analytics',
     'migrate_live_match', 'migrate_sponsors', 'migrate_tournament_registrations', 'migrate_tournament_plans',

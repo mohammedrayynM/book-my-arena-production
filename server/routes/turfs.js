@@ -528,14 +528,14 @@ router.get('/:idOrSlug/slots', async (req, res) => {
 
     const allSlots = generateSlots(openTime, closeTime, slotDuration, timeFormat);
 
-    // Get booked slots (confirmed or temporarily locked in the last 4 minutes)
+    // Get booked slots (confirmed or temporarily held during checkout for 15 minutes)
     let bookedQuery = `
-      SELECT time_slot FROM bookings 
+      SELECT time_slot, payment_status, status FROM bookings 
       WHERE turf_id = ? AND booking_date = ? 
       AND (
         (payment_status = 'success' AND status != 'cancelled')
         OR
-        (payment_status = 'pending' AND status = 'pending' AND created_at > NOW() - INTERVAL 4 MINUTE)
+        (payment_status = 'pending' AND status = 'pending' AND created_at > NOW() - INTERVAL 15 MINUTE)
       )
     `;
     const bookedParams = [turfId, date];
@@ -596,7 +596,8 @@ router.get('/:idOrSlug/slots', async (req, res) => {
       }
     }
 
-    const bookedSlots = booked.map(b => String(b.time_slot).trim());
+    const bookedSuccessSlots = booked.filter(b => b.payment_status === 'success').map(b => String(b.time_slot).trim());
+    const bookedPendingSlots = booked.filter(b => b.payment_status === 'pending').map(b => String(b.time_slot).trim());
     const blockedSlots = blocked.map(b => String(b.time_slot).trim());
 
     // slots held by an ACTIVE subscription (member-reserved) are shown as their own status
@@ -612,13 +613,15 @@ router.get('/:idOrSlug/slots', async (req, res) => {
 
     const slots = allSlots.map(slot => {
       const normalizedSlot = String(slot).trim();
-      const status = bookedSlots.includes(normalizedSlot)
+      const status = bookedSuccessSlots.includes(normalizedSlot)
         ? 'booked'
-        : blockedSlots.includes(normalizedSlot)
-          ? 'blocked'
-          : isSubscriptionReserved(normalizedSlot)
-            ? 'subscription_reserved'
-            : 'available';
+        : bookedPendingSlots.includes(normalizedSlot)
+          ? 'held'
+          : blockedSlots.includes(normalizedSlot)
+            ? 'blocked'
+            : isSubscriptionReserved(normalizedSlot)
+              ? 'subscription_reserved'
+              : 'available';
 
       const offerData = priceMap[normalizedSlot] || {};
       const startMins = getSlotStartMinutes(normalizedSlot);

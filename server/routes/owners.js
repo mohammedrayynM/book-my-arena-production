@@ -234,7 +234,7 @@ router.post('/login', async (req, res) => {
 
     res.json({
       token,
-      owner: { id: owner.id, name: owner.name, email: owner.email, phone: owner.phone }
+      owner: { id: owner.id, name: owner.name, email: owner.email, phone: owner.phone, business_types: owner.business_types || null }
     });
   } catch (err) {
     console.error('Error logging in owner:', err);
@@ -1089,7 +1089,6 @@ router.post('/turfs/:id/block-slot', verifyToken, verifyOwner, async (req, res) 
       return res.status(503).json({ error: 'Could not acquire slot lock. Please try again.' });
     }
 
-    const vlock = await subscriptionReservations.lockVenue(req.params.id);
     try {
       const availCheck = await availabilityService.checkSingleSlotAvailability({
         turfId: req.params.id,
@@ -1117,7 +1116,6 @@ router.post('/turfs/:id/block-slot', verifyToken, verifyOwner, async (req, res) 
 
       res.json({ success: true, message: 'Slot blocked successfully' });
     } finally {
-      await vlock.release();
       if (lockAcquired) {
         await releaseSlotLock(req.params.id, court_id || null, block_date).catch((unlockErr) => {
           console.warn('⚠️ Failed to release owner slot lock:', unlockErr.message || unlockErr);
@@ -1213,9 +1211,9 @@ router.post('/turfs/:id/block-slots/bulk', verifyToken, verifyOwner, async (req,
 
     // Start transaction
     const connection = await pool.getConnection();
-    const vlock = await subscriptionReservations.lockVenue(req.params.id);
     try {
       await connection.beginTransaction();
+      await connection.query('SELECT id FROM turfs WHERE id = ? FOR UPDATE', [req.params.id]);
 
       for (const slot of time_slots) {
         const availCheck = await availabilityService.checkSingleSlotAvailability({
@@ -1245,7 +1243,6 @@ router.post('/turfs/:id/block-slots/bulk', verifyToken, verifyOwner, async (req,
       throw err;
     } finally {
       connection.release();
-      await vlock.release();
       if (lockAcquired) {
         await releaseSlotLock(req.params.id, court_id || null, block_date).catch((unlockErr) => {
           console.warn('⚠️ Failed to release owner bulk slot lock:', unlockErr.message || unlockErr);
@@ -1340,12 +1337,16 @@ router.post('/turfs/:id/unblock-slots/bulk', verifyToken, verifyOwner, async (re
 router.get('/bookings', verifyToken, verifyOwner, async (req, res) => {
   try {
     const [rows] = await pool.query(
-      `SELECT b.id, b.payment_id, b.customer_name, b.customer_phone, b.customer_email,
+      `SELECT b.id, b.turf_id, b.court_id, b.payment_id, b.customer_name, b.customer_phone, b.customer_email,
               b.booking_date, b.time_slot, b.amount, b.original_price,
               b.payment_status, b.status, b.created_at, b.currency_code,
               b.discount_amount, b.advance_amount, b.pending_balance, b.payment_type,
               b.need_players, b.match_request_id,
               t.name as turf_name, c.name as court_name,
+              t.billing_model as turf_billing_model,
+              t.route_commission_type, t.route_split_percentage, t.commission_percentage,
+              t.route_flat_amount, t.monthly_subscription_amount,
+              rst.owner_transfer_minor, rst.platform_fee_minor, rst.billing_model as transfer_billing_model,
               (SELECT COALESCE(SUM(mp.amount_paid), 0) 
                FROM match_players mp 
                WHERE mp.match_id = b.match_request_id 
@@ -1354,18 +1355,57 @@ router.get('/bookings', verifyToken, verifyOwner, async (req, res) => {
        FROM bookings b
        JOIN turfs t ON b.turf_id = t.id
        LEFT JOIN courts c ON b.court_id = c.id
+       LEFT JOIN route_split_transfers rst ON rst.razorpay_payment_id = b.payment_id AND rst.status <> 'SUPERSEDED'
        WHERE t.owner_id = ? AND b.payment_status = 'success' AND b.status = 'confirmed'
        ORDER BY b.created_at DESC`,
       [req.user.id]
     );
 
-    // netAmount = exact original_price - discount_amount (no commission deductions)
     const bookings = rows.map(booking => {
       const discount = parseFloat(booking.discount_amount || 0);
-      const netAmount = parseFloat(booking.original_price || booking.amount || 0) - discount;
+      const baseAmount = Math.max(0, parseFloat(booking.original_price || booking.amount || 0) - discount);
+
+      let model = booking.transfer_billing_model || booking.turf_billing_model;
+      if (!model) {
+        if (booking.route_commission_type === 'subscription' || booking.turf_billing_model === 'MONTHLY') model = 'SUBSCRIPTION';
+        else if (booking.route_commission_type === 'flat') model = 'FLAT';
+        else model = 'PERCENTAGE';
+      }
+      model = String(model).toUpperCase();
+
+      let commissionAmount = 0;
+      let deductionLabel = '';
+      let ownerEarnings = baseAmount;
+
+      if (model === 'SUBSCRIPTION') {
+        commissionAmount = 0;
+        deductionLabel = 'Subscription Venue';
+        ownerEarnings = baseAmount;
+      } else if (model === 'FLAT') {
+        const flatFee = booking.platform_fee_minor != null ? (booking.platform_fee_minor / 100) : (parseFloat(booking.route_flat_amount) || 0);
+        commissionAmount = Math.min(flatFee, baseAmount);
+        const curr = booking.currency_code === 'INR' || !booking.currency_code ? '₹' : (booking.currency_code + ' ');
+        deductionLabel = `${curr}${commissionAmount} Flat Fee Deducted`;
+        ownerEarnings = Math.max(0, baseAmount - commissionAmount);
+      } else {
+        // PERCENTAGE
+        const pct = booking.route_split_percentage != null ? parseFloat(booking.route_split_percentage) : (booking.commission_percentage != null ? parseFloat(booking.commission_percentage) : 5);
+        if (booking.platform_fee_minor != null && baseAmount > 0) {
+          commissionAmount = Math.round(booking.platform_fee_minor) / 100;
+        } else {
+          commissionAmount = Math.round((baseAmount * pct / 100) * 100) / 100;
+        }
+        deductionLabel = `${pct}% Book Arena Commission Deducted`;
+        ownerEarnings = Math.max(0, baseAmount - commissionAmount);
+      }
+
       return {
         ...booking,
-        netAmount: Math.round(netAmount * 100) / 100
+        billing_model: model,
+        commission_amount: Math.round(commissionAmount * 100) / 100,
+        deduction_label: deductionLabel,
+        owner_earnings: Math.round(ownerEarnings * 100) / 100,
+        netAmount: Math.round(ownerEarnings * 100) / 100
       };
     });
 

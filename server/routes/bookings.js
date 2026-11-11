@@ -18,6 +18,8 @@ const subscriptionService = require('../services/subscriptionService');
 const subscriptionReservations = require('../services/subscriptionReservations');
 const availabilityService = require('../services/availabilityService');
 const venueBillingRestrictions = require('../services/venueBillingRestrictions');
+const activityBooking = require('../services/activityBooking');
+const billingConfig = require('../services/billingConfig');
 require('dotenv').config();
 
 const razorpay = new Razorpay({
@@ -713,7 +715,24 @@ router.post('/', verifyCustomer, async (req, res) => {
 
     // FINAL CALCULATION
     const priceAfterCoupon = totalBasePrice - discountAmount; // coupon applied FIRST
+    
+    // Fetch active customer fee rule for venues
     let serviceFee = 0;
+    let serviceFeeTax = 0;
+    let showFeeAtCheckout = true;
+    let feeRuleId = null;
+    let feeRuleSnapshot = null;
+    try {
+      const activeFeeRule = await billingConfig.getActiveFeeRule(turf.country_code || 'IN', venueCurrency, 'VENUE');
+      const feeCalc = billingConfig.calculateCustomerFee(activeFeeRule, priceAfterCoupon);
+      serviceFee = feeCalc.serviceFee;
+      serviceFeeTax = feeCalc.serviceFeeTax;
+      showFeeAtCheckout = feeCalc.showFeeAtCheckout;
+      feeRuleId = feeCalc.feeRuleId;
+      feeRuleSnapshot = feeCalc.feeRuleSnapshot;
+    } catch (feeErr) {
+      console.error('[Bookings] Error calculating customer fee:', feeErr);
+    }
 
     // Find Players: the backend decides the split (services/playerSplit.js). Whatever contribution the client sends is ignored, so the
     // website, the app and the join link always show and charge the same share, worked out from the FINAL (post-coupon) amount.
@@ -728,7 +747,7 @@ router.post('/', verifyCustomer, async (req, res) => {
     let totalPeople = split ? split.participants : null;
     let finalAmount = split ? split.hostShare : priceAfterCoupon;
 
-    finalAmount = Math.max(0, finalAmount + serviceFee);
+    finalAmount = Math.max(0, finalAmount + serviceFee + serviceFeeTax);
 
     const advancePercent = parseInt(currentBookable.advance_percent || turf.advance_percent || 100, 10);
     // With Find Players on there is no advance option: the host pays their whole share online and each player pays theirs through the
@@ -829,12 +848,18 @@ router.post('/', verifyCustomer, async (req, res) => {
         'discount_amount', 'markup_amount', 'service_fee',
         'coupon_code', 'payment_status', 'status', 'user_id', 'currency_code'
       ];
+      const perRowServiceFee = Math.round((serviceFee / targetSlots.length) * 100) / 100;
+      const perRowServiceFeeTax = Math.round((serviceFeeTax / targetSlots.length) * 100) / 100;
+
       let vals = [
         turf_id, court_id || null, customer_name, customer_phone, customer_email || '',
         booking_date, ts, perRowFinalAmount, spPrice,
-        perRowDiscountAmount, 0, 0,
+        perRowDiscountAmount, 0, perRowServiceFee,
         appliedCouponCode, 'pending', 'pending', user_id || null, venueCurrency
       ];
+
+      cols.push('service_fee_tax', 'fee_rule_id', 'fee_rule_snapshot');
+      vals.push(perRowServiceFeeTax, feeRuleId, feeRuleSnapshot);
 
       if (hasPaymentType) { cols.push('payment_type'); vals.push(paymentType); }
       if (hasAdvanceAmount) { cols.push('advance_amount'); vals.push(perRowPayableNow); }
@@ -1120,7 +1145,24 @@ router.post('/calculate-price', optionalAuth, async (req, res) => {
     }
 
     const priceAfterCoupon = totalBasePrice - discountAmount; // coupon applied FIRST
+    
+    // Fetch active customer fee rule for venues
     let serviceFee = 0;
+    let serviceFeeTax = 0;
+    let showFeeAtCheckout = true;
+    let feeRuleId = null;
+    let feeRuleSnapshot = null;
+    try {
+      const activeFeeRule = await billingConfig.getActiveFeeRule(turf.country_code || 'IN', turf.currency_code || 'INR', 'VENUE');
+      const feeCalc = billingConfig.calculateCustomerFee(activeFeeRule, priceAfterCoupon);
+      serviceFee = feeCalc.serviceFee;
+      serviceFeeTax = feeCalc.serviceFeeTax;
+      showFeeAtCheckout = feeCalc.showFeeAtCheckout;
+      feeRuleId = feeCalc.feeRuleId;
+      feeRuleSnapshot = feeCalc.feeRuleSnapshot;
+    } catch (feeErr) {
+      console.error('[Bookings] Error calculating customer fee in calculate-price:', feeErr);
+    }
 
     // Find Players: the backend decides the split (services/playerSplit.js). Whatever contribution the client sends is ignored, so the
     // website, the app and the join link always show and charge the same share, worked out from the FINAL (post-coupon) amount.
@@ -1157,7 +1199,11 @@ router.post('/calculate-price', optionalAuth, async (req, res) => {
       markupAmount,
       discountAmount,
       serviceFee,
-      finalAmount,                      // host's payable amount (after coupon + split)
+      serviceFeeTax,
+      totalCustomerFee: Math.round((serviceFee + serviceFeeTax) * 100) / 100,
+      showFeeAtCheckout,
+      feeRuleId,
+      finalAmount,                      // host's payable amount (after coupon + split + customer fee + tax)
       originalFinalAmount: priceAfterCoupon, // full slot cost after coupon (before split)
       contributionAmount: perPlayerContrib,  // per player contribution share
       advancePercent,
@@ -1781,16 +1827,74 @@ router.post('/cancel-pending', verifyCustomer, async (req, res) => {
     if (owned.length !== ids.length) return res.status(403).json({ error: 'Not authorized to cancel this booking' });
     // A client-side close/cancel signal is not proof that Razorpay did not capture the payment.
     // Keep the hold pending until Razorpay's verified result arrives or the normal expiry cleanup runs.
-    const [pendingRows] = await pool.query(
-      `SELECT id FROM bookings WHERE id IN (${placeholders}) AND payment_status = 'pending' AND status = 'pending'`,
+    const [bookingRows] = await pool.query(
+      `SELECT id, razorpay_order_id, payment_status, status, coupon_code FROM bookings WHERE id IN (${placeholders})`,
       ids
     );
+
+    // If already confirmed with verified payment
+    if (bookingRows.some(b => b.status === 'confirmed' || b.payment_status === 'success')) {
+      return res.json({ success: true, confirmed: true, message: 'Booking is already confirmed with verified payment.' });
+    }
+
+    const orderId = bookingRows.find(b => b.razorpay_order_id)?.razorpay_order_id;
+    let hasCapturedPayment = false;
+    let capturedPaymentId = null;
+
+    if (orderId) {
+      try {
+        const payments = await routeProvider.fetchOrderPayments(orderId);
+        const captured = payments.find(p => p.status === 'captured');
+        if (captured) {
+          hasCapturedPayment = true;
+          capturedPaymentId = captured.id;
+        }
+      } catch (gatewayErr) {
+        console.warn(`[Payments] Could not query Razorpay for order ${orderId}:`, gatewayErr.message);
+      }
+    }
+
+    if (hasCapturedPayment && capturedPaymentId) {
+      console.log(`[Payments] cancel-pending detected captured payment ${capturedPaymentId} for order ${orderId}. Confirming booking!`);
+      await confirmBookings(ids, capturedPaymentId);
+      try {
+        await sendBookingConfirmationEmails(ids);
+      } catch (emailErr) {
+        console.warn('[Payments] Email send on reconciled confirmation failed:', emailErr.message);
+      }
+      return res.json({
+        success: true,
+        confirmed: true,
+        message: 'Payment was verified. Your booking is confirmed.'
+      });
+    }
+
+    // No captured payment exists on Razorpay!
+    // Safely mark as cancelled and release the temporary hold immediately!
+    await pool.query(
+      `UPDATE bookings SET payment_status = 'cancelled', status = 'cancelled', cancelled_at = NOW(), cancel_reason = 'payment_cancelled'
+       WHERE id IN (${placeholders}) AND status = 'pending'`,
+      ids
+    );
+
+    // Rollback coupon usage count if applied to pending booking
+    try {
+      const couponCodes = [...new Set(bookingRows.map(b => b.coupon_code).filter(Boolean))];
+      for (const code of couponCodes) {
+        await pool.query('UPDATE coupons SET used_count = GREATEST(0, used_count - 1) WHERE code = ?', [code]).catch(() => {});
+        await pool.query('UPDATE admin_coupons SET used_count = GREATEST(0, used_count - 1) WHERE code = ?', [code]).catch(() => {});
+        await pool.query(`DELETE FROM coupon_usages WHERE booking_id IN (${placeholders})`, ids).catch(() => {});
+        await pool.query(`DELETE FROM admin_coupon_usages WHERE booking_id IN (${placeholders})`, ids).catch(() => {});
+      }
+    } catch (cErr) {
+      console.warn('[Payments] Error releasing coupon usage on cancel:', cErr.message);
+    }
+
+    console.log(`[Payments] Successfully cancelled pending booking(s) ${ids.join(',')} and released slot hold.`);
     res.json({
       success: true,
-      pending: pendingRows.length > 0,
-      message: pendingRows.length
-        ? 'Payment status is being reconciled. The booking is not confirmed.'
-        : 'Booking payment status has already been resolved.'
+      cancelled: true,
+      message: 'Pending booking cancelled and slot released safely.'
     });
   } catch (err) {
     console.error('Error cancelling pending booking:', err);
@@ -1940,6 +2044,27 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
         return res.json({ status: venueBillingResult.accepted ? 'ok' : 'ignored' });
       }
 
+      // An Amusement Park / Activity booking payment?
+      if (order_id) {
+        const [[actBooking]] = await pool.query(
+          'SELECT id, status, payment_status, total_amount, currency_code FROM activity_bookings WHERE razorpay_order_id = ?',
+          [order_id]
+        );
+        if (actBooking) {
+          const expectedCurrency = actBooking.currency_code || 'INR';
+          const expectedMinor = toMinor(Number(actBooking.total_amount), expectedCurrency);
+          if (captured_currency === expectedCurrency && Number(captured_amount) >= expectedMinor) {
+            const actResult = await activityBooking.confirmBooking({ bookingId: actBooking.id, paymentId: payment_id });
+            if (!actResult.error && !actResult.already) {
+              fireNotification('activity.booking_confirmed', { bookingId: actBooking.id });
+            }
+          } else {
+            console.error(`[Webhook] activity payment ${payment_id} captured ${captured_amount} but booking needs ${expectedMinor}`);
+          }
+          return res.json({ status: 'ok' });
+        }
+      }
+
       const hasRazorpayOrderId = await hasColumn('bookings', 'razorpay_order_id');
       let rows = [];
 
@@ -2081,6 +2206,9 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
         : { notFound: true };
       if (!venueBillingFailure.notFound) return res.json({ status: 'ok' });
       const failedSub = failedPayment.order_id ? await subscriptionService.reportPaymentFailed({ orderId: failedPayment.order_id, paymentId: failedPayment.id }) : { notFound: true };
+      if (failedPayment.order_id) {
+        await pool.query("UPDATE activity_bookings SET payment_status = 'failed' WHERE razorpay_order_id = ? AND status = 'pending'", [failedPayment.order_id]).catch(() => {});
+      }
       if (failedSub.notFound && failedPayment.order_id) {
         const [failedBookings] = await pool.query('SELECT id FROM bookings WHERE razorpay_order_id = ?', [failedPayment.order_id]);
         if (failedBookings.length > 0) fireNotification('booking.failed', { bookingIds: failedBookings.map((b) => b.id), reason: 'payment_failed', paymentId: failedPayment.id });
@@ -2179,6 +2307,7 @@ router.post('/cleanup-pending', async (req, res) => {
 });
 
 // POST /api/bookings/release — Release or cancel a pending/temporary booking slot
+// Reconciles with Razorpay first to avoid releasing a slot that was actually paid.
 router.post('/release', verifyCustomer, async (req, res) => {
   try {
     const { booking_id } = req.body;
@@ -2186,18 +2315,45 @@ router.post('/release', verifyCustomer, async (req, res) => {
       return res.status(400).json({ error: 'booking_id is required' });
     }
     const ids = String(booking_id).split(',').map(id => parseInt(id.trim())).filter(id => !isNaN(id));
-    if (ids.length > 0) {
-      const placeholders = ids.map(() => '?').join(',');
-      const [owned] = await pool.query(
-        `SELECT id FROM bookings WHERE id IN (${placeholders}) AND user_id = ?`,
-        [...ids, req.user.id]
-      );
-      if (owned.length !== ids.length) return res.status(403).json({ error: 'Not authorized to release this booking' });
-      await pool.query(
-        `UPDATE bookings SET payment_status = 'failed', status = 'cancelled' WHERE id IN (${placeholders}) AND status = 'pending'`,
-        [...ids]
-      );
+    if (ids.length === 0) return res.status(400).json({ error: 'No valid booking IDs provided' });
+
+    const placeholders = ids.map(() => '?').join(',');
+    const [owned] = await pool.query(
+      `SELECT id FROM bookings WHERE id IN (${placeholders}) AND user_id = ?`,
+      [...ids, req.user.id]
+    );
+    if (owned.length !== ids.length) return res.status(403).json({ error: 'Not authorized to release this booking' });
+
+    // Check if any booking is already confirmed
+    const [bookingRows] = await pool.query(
+      `SELECT id, razorpay_order_id, payment_status, status FROM bookings WHERE id IN (${placeholders})`,
+      ids
+    );
+    if (bookingRows.some(b => b.status === 'confirmed' || b.payment_status === 'success')) {
+      return res.json({ success: true, confirmed: true, message: 'Booking is already confirmed with verified payment.' });
     }
+
+    // Reconcile with Razorpay before releasing
+    const orderId = bookingRows.find(b => b.razorpay_order_id)?.razorpay_order_id;
+    if (orderId) {
+      try {
+        const payments = await routeProvider.fetchOrderPayments(orderId);
+        const captured = payments.find(p => p.status === 'captured');
+        if (captured) {
+          console.log(`[Bookings/release] Found captured payment ${captured.id} for order ${orderId}. Confirming instead of releasing.`);
+          await confirmBookings(ids, captured.id);
+          try { await sendBookingConfirmationEmails(ids); } catch (e) { /* non-critical */ }
+          return res.json({ success: true, confirmed: true, message: 'Payment was verified. Your booking is confirmed.' });
+        }
+      } catch (e) {
+        console.warn('[Bookings/release] Razorpay query failed:', e.message);
+      }
+    }
+
+    await pool.query(
+      `UPDATE bookings SET payment_status = 'failed', status = 'cancelled', cancelled_at = NOW(), cancel_reason = 'payment_cancelled' WHERE id IN (${placeholders}) AND status = 'pending'`,
+      [...ids]
+    );
     res.json({ success: true, message: 'Temporary booking slots released successfully' });
   } catch (err) {
     console.error('Error releasing slot:', err);

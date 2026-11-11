@@ -1500,4 +1500,147 @@ router.get('/:id/squads', async (req, res) => {
   }
 });
 
+
+// GET /api/tournaments/:id/search-players - Search registered Book Arena users for roster addition
+router.get('/:id/search-players', verifyToken, verifyHost, async (req, res) => {
+  try {
+    const tournamentId = req.params.id;
+    const query = String(req.query.query || '').trim();
+    if (!query || query.length < 2) {
+      return res.json({ success: true, users: [] });
+    }
+
+    const searchTerm = `%${query}%`;
+    const [users] = await pool.query(`
+      SELECT u.id, u.name, u.email, u.phone, u.profile_pic,
+             (SELECT tp.team_id FROM tournament_participants tp WHERE tp.tournament_id = ? AND tp.user_id = u.id LIMIT 1) as existing_team_id,
+             (SELECT tt.name FROM tournament_participants tp JOIN tournament_teams tt ON tt.id = tp.team_id WHERE tp.tournament_id = ? AND tp.user_id = u.id LIMIT 1) as existing_team_name
+      FROM users u
+      WHERE (u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?)
+      ORDER BY u.name ASC
+      LIMIT 20
+    `, [tournamentId, tournamentId, searchTerm, searchTerm, searchTerm]);
+
+    const formatted = users.map(u => ({
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      phone: u.phone,
+      avatar: u.profile_pic,
+      is_already_in_tournament: Boolean(u.existing_team_id),
+      existing_team_id: u.existing_team_id || null,
+      existing_team_name: u.existing_team_name || null,
+    }));
+
+    res.json({ success: true, users: formatted });
+  } catch (error) {
+    console.error('Error searching players:', error);
+    res.status(500).json({ success: false, error: 'Failed to search players' });
+  }
+});
+
+// GET /api/tournaments/:id/players/:participantId/profile - Player full tournament profile and statistics
+router.get('/:id/players/:participantId/profile', async (req, res) => {
+  try {
+    const { id: tournamentId, participantId } = req.params;
+    const [players] = await pool.query(`
+      SELECT p.*, COALESCE(p.player_name, u.name) as display_name, u.email as user_email,
+             COALESCE(p.profile_photo, u.profile_pic) as avatar, t.name as team_name, t.logo as team_logo
+      FROM tournament_participants p
+      LEFT JOIN users u ON p.user_id = u.id
+      LEFT JOIN tournament_teams t ON p.team_id = t.id
+      WHERE p.id = ? AND p.tournament_id = ?
+    `, [participantId, tournamentId]);
+
+    if (!players.length) {
+      return res.status(404).json({ success: false, error: 'Player not found' });
+    }
+    const player = players[0];
+
+    // Compute aggregate tournament stats
+    const [events] = await pool.query(`
+      SELECT e.id, e.event_type, e.value, e.metadata, e.match_id
+      FROM tournament_match_events e
+      WHERE e.match_id IN (SELECT id FROM tournament_fixtures WHERE tournament_id = ?)
+        AND e.is_undone = false
+        AND (e.player_id = ? OR JSON_EXTRACT(e.metadata, '$.bowler_id') = ? OR JSON_EXTRACT(e.metadata, '$.fielder_id') = ?)
+    `, [tournamentId, participantId, participantId, participantId]);
+
+    let runs = 0;
+    let ballsFaced = 0;
+    let fours = 0;
+    let sixes = 0;
+    let wickets = 0;
+    let oversBalls = 0;
+    let runsConceded = 0;
+    let goals = 0;
+    let assists = 0;
+    const matchIds = new Set();
+
+    for (const ev of events) {
+      matchIds.add(ev.match_id);
+      let meta = ev.metadata;
+      if (typeof meta === 'string') { try { meta = JSON.parse(meta); } catch { meta = {}; } }
+      if (!meta) meta = {};
+
+      if (Number(ev.player_id) === Number(participantId)) {
+        if (ev.event_type === 'RUN') {
+          runs += Number(ev.value) || 0;
+          ballsFaced += 1;
+          if (Number(ev.value) === 4) fours += 1;
+          if (Number(ev.value) === 6) sixes += 1;
+        } else if (ev.event_type === 'NO_BALL') {
+          const offBat = Number(meta.off_bat) || 0;
+          runs += offBat;
+          ballsFaced += 1;
+          if (offBat === 4) fours += 1;
+          if (offBat === 6) sixes += 1;
+        } else if (ev.event_type === 'BYE' || ev.event_type === 'LEG_BYE') {
+          ballsFaced += 1;
+        } else if (ev.event_type === 'GOAL') {
+          goals += 1;
+        } else if (ev.event_type === 'ASSIST') {
+          assists += 1;
+        }
+      }
+
+      if (meta.bowler_id && Number(meta.bowler_id) === Number(participantId)) {
+        if (['RUN', 'NO_BALL', 'WIDE'].includes(ev.event_type)) {
+          runsConceded += Number(ev.value) || 0;
+        }
+        if (['RUN', 'BYE', 'LEG_BYE', 'WICKET'].includes(ev.event_type) && !meta.off_wide && !meta.off_no_ball) {
+          oversBalls += 1;
+        }
+        if (ev.event_type === 'WICKET' && ['bowled', 'caught', 'lbw', 'stumped', 'hit_wicket', 'caught_and_bowled'].includes(meta.dismissal)) {
+          wickets += 1;
+        }
+      }
+    }
+
+    const stats = {
+      matches_played: matchIds.size,
+      cricket: {
+        runs,
+        balls_faced: ballsFaced,
+        fours,
+        sixes,
+        strike_rate: ballsFaced ? Math.round((runs / ballsFaced) * 10000) / 100 : 0,
+        wickets,
+        overs: `${Math.floor(oversBalls / 6)}.${oversBalls % 6}`,
+        runs_conceded: runsConceded,
+        economy: oversBalls ? Math.round((runsConceded / (oversBalls / 6)) * 100) / 100 : 0,
+      },
+      football: {
+        goals,
+        assists,
+      }
+    };
+
+    res.json({ success: true, player, stats });
+  } catch (error) {
+    console.error('Error fetching player profile:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch player profile' });
+  }
+});
+
 module.exports = router;

@@ -167,7 +167,12 @@ router.post('/:id/events', verifyToken, verifyHost, async (req, res) => {
     // ---- cricket: the rest of the delivery -----------------------------------------------------------
     if (familyOf(match.sport) === 'cricket') {
       const fieldingTeamId = isTeamA ? match.team_b_id : match.team_a_id;
-      meta.innings = Math.max(1, toId(body.innings) || match.current_innings || 1);
+      const requestedInnings = toId(body.innings);
+      if (!requestedInnings && match.batting_team_id && Number(teamId) !== Number(match.batting_team_id) && (match.current_innings || 1) === 1) {
+        meta.innings = 2;
+      } else {
+        meta.innings = Math.max(1, requestedInnings || match.current_innings || 1);
+      }
       meta.bowling_team_id = fieldingTeamId;
 
       const nonStriker = await checkPlayer(body.non_striker_id);
@@ -255,25 +260,37 @@ router.post('/:id/events', verifyToken, verifyHost, async (req, res) => {
     `, [matchId, spec.type, teamId, playerId, spec.delta, JSON.stringify(meta), req.user.id, clientEventId]);
     const eventId = result.insertId;
 
-    if (spec.delta !== 0) {
-      await connection.query(`UPDATE tournament_fixtures SET ${isTeamA ? 'team_a_score' : 'team_b_score'} = ${isTeamA ? 'team_a_score' : 'team_b_score'} + ? WHERE id = ?`, [spec.delta, matchId]);
-    }
-    // the fixture row is locked for this transaction, so the new totals are exactly current + delta (one query saved per tap)
     const updated = {
       team_a_score: match.team_a_score + (isTeamA ? spec.delta : 0),
       team_b_score: match.team_b_score + (isTeamA ? 0 : spec.delta),
     };
-    // Keep the fixture's own idea of who is at the crease in step with the ball just recorded, so a scorer
-    // who reopens the screen (or a second scorer) picks up exactly where play is.
+    // Keep the fixture's score and who is at the crease in exact step with the replay of all active events.
     if (familyOf(match.sport) === 'cricket') {
-      const after = replayCricket(
-        (await connection.query('SELECT id, event_type, team_id, player_id, value, metadata, is_undone FROM tournament_match_events WHERE match_id = ? AND is_undone = false', [matchId]))[0],
-        { oversLimit: match.overs_limit || null });
+      const [allActive] = await connection.query(
+        'SELECT id, event_type, team_id, player_id, value, metadata, is_undone FROM tournament_match_events WHERE match_id = ? AND is_undone = false',
+        [matchId]
+      );
+      const after = replayCricket(allActive, { oversLimit: match.overs_limit || null });
+      let calcA = 0, calcB = 0;
+      for (const inn of after.innings) {
+        if (Number(inn.batting_team_id) === Number(match.team_a_id)) calcA += inn.runs;
+        else if (Number(inn.batting_team_id) === Number(match.team_b_id)) calcB += inn.runs;
+      }
       await connection.query(
-        'UPDATE tournament_fixtures SET striker_id = ?, non_striker_id = ?, bowler_id = ?, batting_team_id = ?, bowling_team_id = ?, current_innings = ? WHERE id = ?',
-        [after.current.striker_id, after.current.non_striker_id, after.current.bowler_id,
-         after.current.batting_team_id, isTeamA ? match.team_b_id : match.team_a_id,
-         after.current.innings, matchId]);
+        `UPDATE tournament_fixtures
+          SET team_a_score = ?, team_b_score = ?, striker_id = ?, non_striker_id = ?, bowler_id = ?,
+              batting_team_id = ?, bowling_team_id = ?, current_innings = ?
+          WHERE id = ?`,
+        [calcA, calcB, after.current.striker_id, after.current.non_striker_id, after.current.bowler_id,
+         after.current.batting_team_id, Number(after.current.batting_team_id) === Number(match.team_a_id) ? match.team_b_id : match.team_a_id,
+         after.current.innings, matchId]
+      );
+      updated.team_a_score = calcA;
+      updated.team_b_score = calcB;
+    } else {
+      if (spec.delta !== 0) {
+        await connection.query(`UPDATE tournament_fixtures SET ${isTeamA ? 'team_a_score' : 'team_b_score'} = ${isTeamA ? 'team_a_score' : 'team_b_score'} + ? WHERE id = ?`, [spec.delta, matchId]);
+      }
     }
 
     await connection.commit();
@@ -492,7 +509,27 @@ router.delete('/:id/events/:eventId', verifyToken, verifyHost, async (req, res) 
       [req.user.id, eventId]
     );
 
-    if (event.value && event.team_id) {
+    if (familyOf(match.sport) === 'cricket') {
+      const [allActive] = await connection.query(
+        'SELECT id, event_type, team_id, player_id, value, metadata, is_undone FROM tournament_match_events WHERE match_id = ? AND is_undone = false',
+        [matchId]
+      );
+      const after = replayCricket(allActive, { oversLimit: match.overs_limit || null });
+      let calcA = 0, calcB = 0;
+      for (const inn of after.innings) {
+        if (Number(inn.batting_team_id) === Number(match.team_a_id)) calcA += inn.runs;
+        else if (Number(inn.batting_team_id) === Number(match.team_b_id)) calcB += inn.runs;
+      }
+      await connection.query(
+        `UPDATE tournament_fixtures
+          SET team_a_score = ?, team_b_score = ?, striker_id = ?, non_striker_id = ?, bowler_id = ?,
+              batting_team_id = ?, bowling_team_id = ?, current_innings = ?
+          WHERE id = ?`,
+        [calcA, calcB, after.current.striker_id, after.current.non_striker_id, after.current.bowler_id,
+         after.current.batting_team_id, Number(after.current.batting_team_id) === Number(match.team_a_id) ? match.team_b_id : match.team_a_id,
+         after.current.innings, matchId]
+      );
+    } else if (event.value && event.team_id) {
       const col = event.team_id === match.team_a_id ? 'team_a_score' : event.team_id === match.team_b_id ? 'team_b_score' : null;
       if (col) await connection.query(`UPDATE tournament_fixtures SET ${col} = GREATEST(0, ${col} - ?) WHERE id = ?`, [event.value, matchId]);
     }

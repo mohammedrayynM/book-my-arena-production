@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const pool = require('../config/db');
 const { verifyToken, verifyCustomer, optionalAuth } = require('../middleware/auth');
 const activityBooking = require('../services/activityBooking');
+const routeProvider = require('../services/routeProvider');
 const { fire: fireNotification } = require('../utils/notifications/events');
 const { rateLimit } = require('../middleware/rateLimit');
 // Keyed by who is acting, not by IP: behind a proxy every customer shares one IP, so an IP key would throttle everybody together.
@@ -278,10 +279,44 @@ router.post('/cancel-pending', verifyCustomer, verifyLimiter, async (req, res) =
   try {
     const { booking_id } = req.body || {};
     if (!booking_id) return bad(res, 400, 'booking_id is required');
-    const [result] = await pool.query("UPDATE activity_bookings SET status = 'cancelled', payment_status = 'failed' WHERE id = ? AND user_id = ? AND status = 'pending'", [booking_id, req.user.id]);
-    if (!result.affectedRows) return bad(res, 404, 'Pending booking not found');
-    res.json({ success: true });
-  } catch (e) { bad(res, 500, 'Could not cancel this booking'); }
+    const [[booking]] = await pool.query(
+      'SELECT id, razorpay_order_id, status, payment_status FROM activity_bookings WHERE id = ? AND user_id = ?',
+      [booking_id, req.user.id]
+    );
+    if (!booking) return bad(res, 404, 'Booking not found');
+    if (booking.status === 'confirmed' || booking.payment_status === 'success') {
+      return res.json({ success: true, confirmed: true, message: 'Booking already confirmed with verified payment.' });
+    }
+
+    let hasCaptured = false;
+    let capturedPaymentId = null;
+    if (booking.razorpay_order_id) {
+      try {
+        const payments = await routeProvider.fetchOrderPayments(booking.razorpay_order_id);
+        const cap = payments.find(p => p.status === 'captured');
+        if (cap) {
+          hasCaptured = true;
+          capturedPaymentId = cap.id;
+        }
+      } catch (gatewayErr) {
+        console.warn('[Activities] Could not check order payments with Razorpay:', gatewayErr.message);
+      }
+    }
+
+    if (hasCaptured && capturedPaymentId) {
+      const confirmRes = await activityBooking.confirmBooking({ bookingId: booking.id, paymentId: capturedPaymentId });
+      if (!confirmRes.error && !confirmRes.already) {
+        fireNotification('activity.booking_confirmed', { bookingId: booking.id });
+      }
+      return res.json({ success: true, confirmed: true, message: 'Payment verified. Booking is confirmed.' });
+    }
+
+    await pool.query(
+      "UPDATE activity_bookings SET status = 'cancelled', payment_status = 'cancelled', cancelled_at = NOW(), cancel_reason = 'payment_cancelled' WHERE id = ? AND user_id = ? AND status = 'pending'",
+      [booking_id, req.user.id]
+    );
+    res.json({ success: true, cancelled: true });
+  } catch (e) { console.error('cancel-pending error:', e); bad(res, 500, 'Could not cancel this booking'); }
 });
 
 // What the customer sees on a booking: upcoming | used | expired | cancelled (derived from the booking + its tickets)

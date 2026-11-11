@@ -12,6 +12,7 @@ const { dateOnlyResponses } = require('../utils/tournamentValidation');
 const { todayIn } = require('../utils/timezone');
 const { fromMinor } = require('../utils/money');
 const subs = require('../services/subscriptionService');
+const routeProvider = require('../services/routeProvider');
 const R = require('../services/subscriptionReservations');
 
 // SQL DATE columns leave this router as plain 'YYYY-MM-DD'
@@ -341,11 +342,28 @@ router.post('/hosted/verify', async (req, res) => {
 });
 router.post('/hosted/cancel', async (req, res) => {
   try {
-    const orderId = (req.body || {}).booking_id;
+    const orderId = (req.body || {}).booking_id || (req.body || {}).razorpay_order_id || (req.body || {}).order_id;
     if (!orderId) return fail(res, 400, 'order id is required');
+
+    // Reconcile with Razorpay before releasing — the checkout page may have succeeded even if the tab closed abruptly
+    let capturedPaymentId = null;
+    try {
+      const payments = await routeProvider.fetchOrderPayments(String(orderId));
+      const captured = payments.find(p => p.status === 'captured');
+      if (captured) capturedPaymentId = captured.id;
+    } catch (e) {
+      console.warn('[Subscriptions] hosted/cancel: Razorpay query failed:', e.message);
+    }
+
+    if (capturedPaymentId) {
+      console.log('[Subscriptions] hosted/cancel: found captured payment ' + capturedPaymentId + '. Activating subscription for order ' + orderId);
+      const act = await subs.activateByOrder({ orderId: String(orderId), paymentId: capturedPaymentId });
+      return res.json({ success: true, confirmed: true, activated: act.activated !== false });
+    }
+
     const r = await subs.cancelPayment({ userId: null, orderId: String(orderId) });
     if (r.notFound) return fail(res, 404, 'No subscription purchase found for this payment');
-    res.json({ success: true });
+    res.json({ success: true, cancelled: true });
   } catch (err) { console.error(err); fail(res, 500, 'Could not update the payment'); }
 });
 
@@ -355,12 +373,29 @@ router.post('/cancel-payment', requireCustomer, async (req, res) => {
     const { failed, reason } = req.body || {};
     const razorpay_order_id = (req.body || {}).razorpay_order_id || (req.body || {}).booking_id;
     if (!razorpay_order_id) return fail(res, 400, 'razorpay_order_id is required');
+
+    // Reconcile with Razorpay first — a client cancel signal is not proof of non-payment
+    let capturedPaymentId = null;
+    try {
+      const payments = await routeProvider.fetchOrderPayments(String(razorpay_order_id));
+      const captured = payments.find(p => p.status === 'captured');
+      if (captured) capturedPaymentId = captured.id;
+    } catch (e) {
+      console.warn('[Subscriptions] cancel-payment: Razorpay query failed:', e.message);
+    }
+
+    if (capturedPaymentId) {
+      console.log('[Subscriptions] cancel-payment: found captured payment ' + capturedPaymentId + '. Activating subscription.');
+      const act = await subs.activateByOrder({ orderId: String(razorpay_order_id), paymentId: capturedPaymentId, userId: req.user.id });
+      return res.json({ success: true, confirmed: true, activated: act.activated !== false });
+    }
+
     const r = failed
       ? await (async () => { const [[o]] = await pool.query('SELECT us.user_id FROM subscription_payments sp JOIN user_subscriptions us ON us.id = sp.subscription_id WHERE sp.gateway_order_id = ?', [razorpay_order_id]); if (!o) return { notFound: true }; if (Number(o.user_id) !== Number(req.user.id)) return { forbidden: true }; return subs.reportPaymentFailed({ orderId: razorpay_order_id, reason: reason || 'payment failed' }); })()
       : await subs.cancelPayment({ userId: req.user.id, orderId: razorpay_order_id });
     if (r.notFound) return fail(res, 404, 'No subscription purchase found for this payment');
     if (r.forbidden) return fail(res, 403, 'This payment belongs to another account');
-    res.json({ success: true });
+    res.json({ success: true, cancelled: true });
   } catch (err) { console.error(err); fail(res, 500, 'Could not update the payment'); }
 });
 

@@ -332,8 +332,11 @@ app.use((req, res, next) => {
 app.use(express.urlencoded({ extended: true }));
 
 // Serve uploaded images statically
-// Mounted at /api/uploads as per documentation
+// Mounted at /api/uploads as per documentation (serves uploads/ads and uploads/turfs)
+app.use('/api/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/api/uploads', express.static(path.join(__dirname, 'uploads/turfs')));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads/turfs')));
 
 // Routes
 const turfRoutes = require('./routes/turfs');

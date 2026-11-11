@@ -13,7 +13,7 @@ async function setupAdmin() {
   });
 
   try {
-    const password = 'admin123';
+    const password = 'mr0962';
     const salt = await bcrypt.genSalt(10);
     const hash = await bcrypt.hash(password, salt);
 
@@ -24,10 +24,10 @@ async function setupAdmin() {
     
     if (rows.length === 0) {
       await connection.query('INSERT INTO admins (username, password_hash) VALUES (?, ?)', ['admin', hash]);
-      console.log('✅ Admin account created: admin / admin123');
+      console.log('✅ Admin account created: admin / mr0962');
     } else {
       await connection.query('UPDATE admins SET password_hash = ? WHERE username = ?', [hash, 'admin']);
-      console.log('✅ Admin password updated to: admin123');
+      console.log('✅ Admin password updated to: mr0962');
     }
 
   } catch (err) {
