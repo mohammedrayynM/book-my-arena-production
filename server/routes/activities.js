@@ -23,6 +23,30 @@ const { makeDateOnlyResponses } = require('../utils/tournamentValidation');
 const activityDates = makeDateOnlyResponses(['booking_date', 'date', 'last_visit']);
 const bad = (res, status, error) => res.status(status).json({ success: false, error });
 
+// A pending booking whose Razorpay order already has a CAPTURED payment for the full amount was paid, even though the
+// app never reached /verify (app killed, network drop, hosted checkout redirect). The payment status comes from
+// Razorpay itself — never from the app — and confirmBooking is idempotent (row lock + "already confirmed"), so this is
+// safe to call from several places. Returns 'confirmed' | 'not_paid' | 'amount_mismatch' | 'unknown' | an error string.
+async function reconcilePendingPayment(booking) {
+  if (!booking || booking.status !== 'pending' || !booking.razorpay_order_id) return 'not_paid';
+  let payments;
+  try { payments = await routeProvider.fetchOrderPayments(booking.razorpay_order_id); }
+  catch (gatewayErr) { console.warn('[Activities] Could not check order payments with Razorpay:', gatewayErr.message); return 'unknown'; }
+  const cap = payments.find((p) => p.status === 'captured');
+  if (!cap) return 'not_paid';
+  const { toMinor } = require('../utils/money');
+  const expected = toMinor(Number(booking.total_amount), booking.currency_code || 'INR');
+  if (Number(cap.amount) !== expected || (cap.currency && booking.currency_code && cap.currency !== booking.currency_code)) {
+    console.error(`[Activities] Captured payment ${cap.id} for booking ${booking.id} does not match the booking amount (${cap.amount} vs ${expected}); not confirming.`);
+    return 'amount_mismatch';
+  }
+  const r = await activityBooking.confirmBooking({ bookingId: booking.id, paymentId: cap.id });
+  if (r.error === 'sold_out') { fireNotification('activity.booking_cancelled', { bookingId: booking.id, reason: 'sold_out' }); return 'sold_out'; }
+  if (r.error) return r.error;
+  if (!r.already) fireNotification('activity.booking_confirmed', { bookingId: booking.id });
+  return 'confirmed';
+}
+
 // GET /categories
 router.get('/categories', async (req, res) => {
   try {
@@ -280,36 +304,25 @@ router.post('/cancel-pending', verifyCustomer, verifyLimiter, async (req, res) =
     const { booking_id } = req.body || {};
     if (!booking_id) return bad(res, 400, 'booking_id is required');
     const [[booking]] = await pool.query(
-      'SELECT id, razorpay_order_id, status, payment_status FROM activity_bookings WHERE id = ? AND user_id = ?',
+      'SELECT id, razorpay_order_id, status, payment_status, total_amount, currency_code FROM activity_bookings WHERE id = ? AND user_id = ?',
       [booking_id, req.user.id]
     );
     if (!booking) return bad(res, 404, 'Booking not found');
     if (booking.status === 'confirmed' || booking.payment_status === 'success') {
       return res.json({ success: true, confirmed: true, message: 'Booking already confirmed with verified payment.' });
     }
+    if (booking.status !== 'pending') return res.json({ success: true, cancelled: true });
 
-    let hasCaptured = false;
-    let capturedPaymentId = null;
-    if (booking.razorpay_order_id) {
-      try {
-        const payments = await routeProvider.fetchOrderPayments(booking.razorpay_order_id);
-        const cap = payments.find(p => p.status === 'captured');
-        if (cap) {
-          hasCaptured = true;
-          capturedPaymentId = cap.id;
-        }
-      } catch (gatewayErr) {
-        console.warn('[Activities] Could not check order payments with Razorpay:', gatewayErr.message);
-      }
-    }
-
-    if (hasCaptured && capturedPaymentId) {
-      const confirmRes = await activityBooking.confirmBooking({ bookingId: booking.id, paymentId: capturedPaymentId });
-      if (!confirmRes.error && !confirmRes.already) {
-        fireNotification('activity.booking_confirmed', { bookingId: booking.id });
-      }
+    const outcome = await reconcilePendingPayment(booking);
+    if (outcome === 'confirmed') {
       return res.json({ success: true, confirmed: true, message: 'Payment verified. Booking is confirmed.' });
     }
+    // A captured payment we could not turn into a ticket (sold out / amount mismatch) or a gateway we could not reach:
+    // never cancel blindly — leave it for the webhook / support instead of releasing a booking that may have been paid.
+    if (outcome === 'unknown' || outcome === 'amount_mismatch') {
+      return res.status(202).json({ success: false, pending: true, error: 'We could not confirm the payment status yet. If money was deducted, your ticket will appear in My Tickets shortly or be refunded.' });
+    }
+    if (outcome === 'sold_out') return res.status(409).json({ success: false, error: 'This date sold out while you were paying. You will be refunded.' });
 
     await pool.query(
       "UPDATE activity_bookings SET status = 'cancelled', payment_status = 'cancelled', cancelled_at = NOW(), cancel_reason = 'payment_cancelled' WHERE id = ? AND user_id = ? AND status = 'pending'",
@@ -334,6 +347,14 @@ function displayStatus(b, tickets) {
 router.get('/my/tickets', verifyToken, async (req, res) => {
   try {
     if (req.user.role) return bad(res, 403, 'Only customers have activity tickets');
+    // Recover recent payments the app never verified (closed mid-payment, network drop): confirm them from Razorpay's
+    // own record so their QR tickets appear here. Bounded to a few recent orders so the list stays fast.
+    const [stuck] = await pool.query(
+      `SELECT id, status, razorpay_order_id, total_amount, currency_code FROM activity_bookings
+       WHERE user_id = ? AND status = 'pending' AND razorpay_order_id IS NOT NULL AND created_at >= NOW() - INTERVAL 2 DAY
+       ORDER BY id DESC LIMIT 3`, [req.user.id]
+    );
+    for (const s of stuck) { try { await reconcilePendingPayment(s); } catch (e) { console.warn('reconcile pending:', e.message); } }
     const [bookings] = await pool.query(
       `SELECT b.id, b.booking_code, b.booking_date, b.status, b.payment_status, b.total_amount, b.currency_code, b.refund_amount, b.refund_status, a.name AS activity_name, a.slug, a.images
        FROM activity_bookings b JOIN activities a ON a.id = b.activity_id
@@ -373,12 +394,24 @@ router.post('/my/tickets/:bookingId/cancel', verifyToken, lookupLimiter, async (
 router.get('/my/tickets/:bookingId', verifyToken, async (req, res) => {
   try {
     if (req.user.role) return bad(res, 403, 'Only customers have activity tickets');
-    const [[b]] = await pool.query(
+    const loadBooking = async () => (await pool.query(
       `SELECT b.*, a.name AS activity_name, a.slug, a.location, a.images FROM activity_bookings b JOIN activities a ON a.id = b.activity_id WHERE b.id = ? AND b.user_id = ?`,
       [req.params.bookingId, req.user.id]
-    );
+    ))[0][0];
+    let b = await loadBooking();
+    // someone else's booking or a wrong id: 404, never a 500 (and never reveal whether the id exists)
+    if (!b) return bad(res, 404, 'Booking not found');
+    // the app polls this right after payment: if /verify never arrived, check Razorpay and issue the tickets now
+    if (b.status === 'pending' && b.razorpay_order_id) {
+      const outcome = await reconcilePendingPayment(b);
+      if (outcome === 'confirmed' || outcome === 'sold_out') b = await loadBooking();
+    }
     const [items] = await pool.query('SELECT bi.id, ti.name, ti.name AS ticket_type_name, ti.product_type, ti.image_url, bi.quantity, COALESCE(bi.redeemed_quantity, 0) AS redeemed_quantity, COALESCE(bi.status, "VALID") AS status, bi.unit_price FROM activity_booking_items bi JOIN activity_ticket_types ti ON ti.id = bi.ticket_type_id WHERE bi.booking_id = ?', [b.id]);
-    const [tickets] = await pool.query('SELECT qr_token, quantity_covered, redeemed_quantity, status, valid_from, valid_until FROM activity_tickets WHERE booking_id = ?', [b.id]);
+    // booking_item_id + ticket_type_name label one-person QRs ("Adult 1 of 3"); null for a whole-booking QR
+    const [tickets] = await pool.query(
+      `SELECT t.qr_token, t.quantity_covered, t.redeemed_quantity, t.status, t.valid_from, t.valid_until, t.booking_item_id, tt.name AS ticket_type_name
+       FROM activity_tickets t LEFT JOIN activity_booking_items bi ON bi.id = t.booking_item_id LEFT JOIN activity_ticket_types tt ON tt.id = bi.ticket_type_id
+       WHERE t.booking_id = ? ORDER BY t.id`, [b.id]);
     const cp = await activityBooking.getActivity(b.activity_id);
     const platformPolicy = await require('../services/globalConfig').policyForBooking('activity_bookings', b);
     res.json({ success: true, booking: { ...b, display_status: displayStatus(b, tickets) }, items, tickets, policy: { windowHours: platformPolicy.windowHours, feePercent: platformPolicy.feePercent, cancellationEnabled: platformPolicy.cancellationEnabled, cancellation_hours_before: cp.cancellation_hours_before, refund_percent: Number(cp.refund_percent), cancellation_policy: cp.cancellation_policy } });

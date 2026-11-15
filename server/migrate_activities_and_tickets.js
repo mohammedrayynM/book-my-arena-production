@@ -1,6 +1,7 @@
 const pool = require('./config/db');
 
-async function migrateActivitiesAndTickets() {
+// seed=false / exit=false is how server.js runs it at startup: schema columns + indexes only, no demo data, no exit.
+async function migrateActivitiesAndTickets({ seed = true, exit = true } = {}) {
   console.log('🔄 Starting Activities & Multi-Ticket Database Migrations...');
   
   const isDupErr = (e) => /Duplicate column name|already exists/i.test(String(e?.message || ''));
@@ -51,7 +52,7 @@ async function migrateActivitiesAndTickets() {
     await ensureIndex('CREATE INDEX idx_activity_slug_status ON activities (slug, status)');
 
     // 5. Setup Freedom Amusement Park with complete multi-ticket products
-    const [[freedom]] = await pool.query("SELECT id, owner_id FROM activities WHERE name LIKE '%Freedom%' LIMIT 1");
+    const [[freedom]] = seed ? await pool.query("SELECT id, owner_id FROM activities WHERE name LIKE '%Freedom%' LIMIT 1") : [[]];
     if (freedom) {
       console.log(`🎡 Found Freedom Amusement Park (ID: ${freedom.id})`);
       const actId = freedom.id;
@@ -124,8 +125,12 @@ async function migrateActivitiesAndTickets() {
   } catch (err) {
     console.error('❌ Migration failed:', err);
   } finally {
-    process.exit(0);
+    if (exit) process.exit(0);
   }
 }
 
-migrateActivitiesAndTickets();
+// `node migrate_activities_and_tickets.js` keeps its old behaviour (schema + Freedom Park seed, then exit).
+if (require.main === module) migrateActivitiesAndTickets();
+
+// Startup: the ticket engine (confirmBooking / QR redemption) needs these columns, so server.js ensures them on boot.
+module.exports = () => migrateActivitiesAndTickets({ seed: false, exit: false });

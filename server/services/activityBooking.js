@@ -356,11 +356,25 @@ async function confirmBooking({ bookingId, paymentId }) {
     const validUntil = `${bookingDateStr} ${vUntil}`;
 
     const totalQty = items.reduce((s, i) => s + i.quantity, 0);
-    const token = genToken();
+    let token = genToken();
 
     // Check if ticket row exists for this booking
     const [[existingTicket]] = await connection.query('SELECT id FROM activity_tickets WHERE booking_id = ?', [bookingId]);
-    if (existingTicket) {
+    if (activity.ticket_qr_mode === 'per_ticket' && !existingTicket) {
+      // ONE QR PER PERSON: every unit bought gets its own random token (3 adults + 1 child = 4 QR codes), each tied to its
+      // booking item and admitting exactly one person, so a group can enter separately and one used QR never blocks the rest.
+      let first = null;
+      for (const item of items) {
+        for (let n = 0; n < Number(item.quantity); n++) {
+          const t = genToken(); if (!first) first = t;
+          await connection.query(
+            "INSERT INTO activity_tickets (booking_id, activity_id, owner_id, booking_item_id, qr_token, quantity_covered, redeemed_quantity, status, valid_from, valid_until) VALUES (?, ?, ?, ?, ?, 1, 0, 'VALID', ?, ?)",
+            [bookingId, booking.activity_id, booking.owner_id, item.id, t, validFrom, validUntil]
+          );
+        }
+      }
+      token = first;
+    } else if (existingTicket) {
       await connection.query(
         "UPDATE activity_tickets SET qr_token = ?, quantity_covered = ?, status = 'VALID', valid_from = ?, valid_until = ? WHERE id = ?",
         [token, totalQty, validFrom, validUntil, existingTicket.id]
@@ -437,6 +451,33 @@ async function redeemTicket({ qrToken, ownerId, staffId = null, bookingItemId = 
       await connection.query("UPDATE activity_tickets SET status = 'EXPIRED' WHERE id = ?", [ticket.id]);
       await connection.commit(); await log('EXPIRED', ticket.id, 0, null);
       return { ok: false, reason: 'EXPIRED', message: 'This ticket has expired' };
+    }
+
+    // ONE-PERSON QR (ticket_qr_mode 'per_ticket'): this QR admits exactly one person of one ticket type.
+    if (ticket.booking_item_id) {
+      const [[it]] = await connection.query(
+        `SELECT bi.id, bi.ticket_type_id, tt.name, tt.product_type, bi.quantity, COALESCE(bi.redeemed_quantity, 0) AS redeemed_quantity
+         FROM activity_booking_items bi JOIN activity_ticket_types tt ON tt.id = bi.ticket_type_id WHERE bi.id = ? FOR UPDATE`, [ticket.booking_item_id]);
+      const one = it ? { ...it, quantity: 1, redeemed_quantity: Number(ticket.redeemed_quantity) >= 1 ? 1 : 0 } : null;
+      if (one) one.remaining_quantity = 1 - one.redeemed_quantity;
+      if (!it || Number(ticket.redeemed_quantity) >= Number(ticket.quantity_covered)) {
+        await connection.rollback(); await log('ALREADY_USED', ticket.id, 0, null, ticket.booking_item_id);
+        return { ok: false, reason: 'ALREADY_USED', message: 'This ticket has already been used', items: one ? [one] : [], firstScannedAt: ticket.first_scanned_at };
+      }
+      if (!markComplete) {
+        await connection.commit();
+        return { ok: true, preview: true, per_person: true, booking_code: ticket.booking_code, customer_name: ticket.customer_name, customer_phone: ticket.customer_phone, booking_date: ticket.booking_date, valid_from: ticket.valid_from, valid_until: ticket.valid_until, activity_name: ticket.activity_name, items: [one], total_remaining: 1, ticket: { ...ticket, items: [one], remaining: 1 } };
+      }
+      const newItemRedeemed = Math.min(Number(it.quantity), Number(it.redeemed_quantity) + 1);
+      await connection.query('UPDATE activity_booking_items SET redeemed_quantity = ?, status = ? WHERE id = ?', [newItemRedeemed, newItemRedeemed >= Number(it.quantity) ? 'COMPLETED' : 'PARTIAL', it.id]);
+      await connection.query(
+        "UPDATE activity_tickets SET redeemed_quantity = quantity_covered, status = 'COMPLETED', first_scanned_at = COALESCE(first_scanned_at, NOW()), first_scanned_by = COALESCE(first_scanned_by, ?), completed_at = NOW() WHERE id = ?",
+        [ownerId, ticket.id]
+      );
+      await connection.commit();
+      await log('VALID', ticket.id, 1, `${manual ? 'MANUAL_VERIFICATION: ' : ''}1 × ${it.name}`, it.id);
+      const done = { ...one, redeemed_quantity: 1, remaining_quantity: 0, status: 'COMPLETED' };
+      return { ok: true, per_person: true, redeemed_item: done, quantity_redeemed: 1, items: [done], total_remaining: 0, all_completed: true, first_scanned_at: ticket.first_scanned_at || new Date(), ticket: ticketResponse('COMPLETED') };
     }
 
     // Fetch all item-level entitlements for this booking

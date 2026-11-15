@@ -4,6 +4,18 @@ const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 const { OAuth2Client } = require('google-auth-library');
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+// ID tokens are accepted for the web client (website + Android/iOS apps, which request tokens for the web client id) and,
+// optionally, any extra client ids listed in GOOGLE_CLIENT_IDS (comma separated) — e.g. the iOS client id.
+const googleAudiences = () => [process.env.GOOGLE_CLIENT_ID, ...String(process.env.GOOGLE_CLIENT_IDS || '').split(',')]
+    .map((v) => String(v || '').trim()).filter(Boolean);
+
+// Emails are compared case-insensitively everywhere: the database collation may be case-sensitive (TiDB defaults to
+// utf8mb4_bin), and "Rahul@Gmail.com" signing up with a password and "rahul@gmail.com" arriving from Google must be ONE account.
+const normalizeEmail = (v) => String(v || '').trim().toLowerCase();
+async function findUserByEmail(email) {
+    const [rows] = await pool.query('SELECT * FROM users WHERE LOWER(email) = ? ORDER BY (email = ?) DESC, id ASC LIMIT 1', [email, email]);
+    return rows[0] || null;
+}
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret_key';
@@ -16,6 +28,7 @@ const verifyToken = (req, res, next) => {
     jwt.verify(token, JWT_SECRET, (err, decoded) => {
         if (err) return res.status(401).json({ error: 'Unauthorized' });
         req.userId = decoded.id;
+        req.userRole = decoded.role || null; // customers have no role; owners/admins/staff do
         next();
     });
 };
@@ -23,11 +36,18 @@ const verifyToken = (req, res, next) => {
 // Register
 router.post('/register', async (req, res) => {
     try {
-        const { name, email, password } = req.body;
+        const { name, password } = req.body;
+        const email = normalizeEmail(req.body.email);
         if (!name || !email || !password) return res.status(400).json({ error: 'All fields required' });
 
-        const [existing] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
-        if (existing.length > 0) return res.status(409).json({ error: 'Email already in use' });
+        const existing = await findUserByEmail(email);
+        if (existing) {
+            return res.status(409).json({
+                error: existing.google_id && !existing.password_hash
+                    ? 'This email is already registered with Google. Use "Continue with Google" to sign in.'
+                    : 'Email already in use'
+            });
+        }
 
         const hashedPassword = await bcrypt.hash(password, 10);
         const [result] = await pool.query(
@@ -46,13 +66,15 @@ router.post('/register', async (req, res) => {
 // Login
 router.post('/login', async (req, res) => {
     try {
-        const { email, password } = req.body;
+        const { password } = req.body;
+        const email = normalizeEmail(req.body.email);
         if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
-        const [users] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
-        if (users.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
+        const user = await findUserByEmail(email);
+        if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+        // An account created through Google has no password yet: say so instead of a confusing "invalid credentials".
+        if (!user.password_hash) return res.status(401).json({ error: 'This account uses Google sign-in. Tap "Continue with Google" to sign in.', code: 'GOOGLE_ACCOUNT' });
 
-        const user = users[0];
         const isMatch = await bcrypt.compare(password, user.password_hash);
         if (!isMatch) return res.status(401).json({ error: 'Invalid credentials' });
 
@@ -79,27 +101,29 @@ router.post('/google-login', async (req, res) => {
 
         let payload;
         try {
-            const ticket = await googleClient.verifyIdToken({ idToken, audience: process.env.GOOGLE_CLIENT_ID });
+            const audiences = googleAudiences(); // one id -> plain string (as before); several (web + iOS) -> the list
+            const ticket = await googleClient.verifyIdToken({ idToken, audience: audiences.length === 1 ? audiences[0] : audiences });
             payload = ticket.getPayload();
         } catch (e) {
+            // the reason (wrong audience, expired, bad signature) is what tells you which client id is misconfigured
+            console.warn('Google ID token rejected:', e.message);
             return res.status(401).json({ error: 'Google sign-in could not be verified', code: 'GOOGLE_TOKEN_INVALID' });
         }
         if (!payload || !payload.email || payload.email_verified === false) {
             return res.status(401).json({ error: 'Your Google email is not verified', code: 'GOOGLE_EMAIL_UNVERIFIED' });
         }
         const { sub: googleId, name, picture } = payload;
-        const email = String(payload.email).trim().toLowerCase();
+        const email = normalizeEmail(payload.email);
 
-        let [users] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
-        let user;
-        if (users.length === 0) {
+        let user = await findUserByEmail(email);
+        if (!user) {
             const [result] = await pool.query(
                 'INSERT INTO users (name, email, google_id, profile_pic) VALUES (?, ?, ?, ?)',
                 [name || email.split('@')[0], email, googleId, picture || null]
             );
             user = { id: result.insertId, name: name || email.split('@')[0], email };
         } else {
-            user = users[0];
+            // Same verified email as an existing (e.g. email/password) account: link Google to THAT account, never a second one.
             if (user.google_id && user.google_id !== googleId) {
                 return res.status(409).json({ error: 'This email is linked to a different Google account', code: 'GOOGLE_ACCOUNT_CONFLICT' });
             }
@@ -259,6 +283,59 @@ router.post('/push-token', verifyToken, async (req, res) => {
         console.error('Save push token error:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
+});
+
+// ---- Saved (favourite) venues, stored in the database (they used to live only on the phone) ----
+// Customers only. Venues that were deleted/blocked are hidden from the list but the saved row is kept.
+const customerOnly = (req, res, next) => (req.userRole ? res.status(403).json({ error: 'Saved venues are for customer accounts' }) : next());
+const FAV_SELECT = `SELECT t.*, f.created_at AS saved_at
+  FROM user_favourite_turfs f JOIN turfs t ON t.id = f.turf_id
+  WHERE f.user_id = ? AND (t.is_deleted IS NULL OR t.is_deleted = 0) AND (t.status IS NULL OR t.status != 'BLOCKED')
+  ORDER BY f.created_at DESC`;
+async function favouritesOf(userId) {
+    const [rows] = await pool.query(FAV_SELECT, [userId]);
+    return { turf_ids: rows.map((r) => String(r.id)), turfs: rows };
+}
+async function venueExists(turfId) {
+    const [[t]] = await pool.query('SELECT id FROM turfs WHERE id = ? AND (is_deleted IS NULL OR is_deleted = 0)', [turfId]);
+    return !!t;
+}
+
+// GET /api/users/me/favourites
+router.get('/me/favourites', verifyToken, customerOnly, async (req, res) => {
+    try { res.json({ success: true, ...(await favouritesOf(req.userId)) }); }
+    catch (e) { console.error('favourites list:', e.message); res.status(500).json({ error: 'Could not load saved venues' }); }
+});
+
+// PUT /api/users/me/favourites/:turfId — save (idempotent)
+router.put('/me/favourites/:turfId', verifyToken, customerOnly, async (req, res) => {
+    try {
+        const turfId = parseInt(req.params.turfId, 10);
+        if (!turfId || !(await venueExists(turfId))) return res.status(404).json({ error: 'Venue not found' });
+        await pool.query('INSERT IGNORE INTO user_favourite_turfs (user_id, turf_id) VALUES (?, ?)', [req.userId, turfId]);
+        res.json({ success: true, saved: true });
+    } catch (e) { console.error('favourite add:', e.message); res.status(500).json({ error: 'Could not save the venue' }); }
+});
+
+// DELETE /api/users/me/favourites/:turfId — unsave (idempotent)
+router.delete('/me/favourites/:turfId', verifyToken, customerOnly, async (req, res) => {
+    try {
+        await pool.query('DELETE FROM user_favourite_turfs WHERE user_id = ? AND turf_id = ?', [req.userId, parseInt(req.params.turfId, 10) || 0]);
+        res.json({ success: true, saved: false });
+    } catch (e) { console.error('favourite remove:', e.message); res.status(500).json({ error: 'Could not remove the venue' }); }
+});
+
+// POST /api/users/me/favourites/sync { turf_ids: [...] } — merge venues saved on the phone (e.g. before signing in) into the
+// account, then return the account's full list. Unknown/deleted venue ids are ignored. Never removes anything.
+router.post('/me/favourites/sync', verifyToken, customerOnly, async (req, res) => {
+    try {
+        const ids = [...new Set((Array.isArray(req.body?.turf_ids) ? req.body.turf_ids : []).map((v) => parseInt(v, 10)).filter((v) => v > 0))].slice(0, 200);
+        if (ids.length) {
+            const [valid] = await pool.query('SELECT id FROM turfs WHERE id IN (?) AND (is_deleted IS NULL OR is_deleted = 0)', [ids]);
+            if (valid.length) await pool.query('INSERT IGNORE INTO user_favourite_turfs (user_id, turf_id) VALUES ?', [valid.map((v) => [req.userId, v.id])]);
+        }
+        res.json({ success: true, ...(await favouritesOf(req.userId)) });
+    } catch (e) { console.error('favourites sync:', e.message); res.status(500).json({ error: 'Could not sync saved venues' }); }
 });
 
 module.exports = router;

@@ -183,6 +183,10 @@ async function ensureAdminAndVenueEnhancements() {
     await ensureColumn('turfs', "next_billing_date DATE");
     await ensureColumn('turfs', "status VARCHAR(50) DEFAULT 'ACTIVE'");
     await ensureColumn('turfs', "is_deleted TINYINT(1) DEFAULT 0");
+    await ensureColumn('turfs', "deleted_at DATETIME NULL");
+    await ensureColumn('turfs', "deleted_by VARCHAR(40) NULL");
+    // every booking query uses bookings.user_id; production has it, but no script created it (a fresh DB could not run)
+    await ensureColumn('bookings', "user_id INT NULL");
 
     // owners deletion / status columns
     await ensureColumn('owners', "is_deleted TINYINT(1) DEFAULT 0");
@@ -195,6 +199,24 @@ async function ensureAdminAndVenueEnhancements() {
 ensureAdminAndVenueEnhancements();
 
 // Ensure contact/inbox messages table exists (idempotent).
+// Saved (favourite) venues per customer, in the database rather than only on the phone (idempotent, additive).
+async function ensureFavouritesTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_favourite_turfs (
+        user_id INT NOT NULL,
+        turf_id INT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, turf_id),
+        INDEX idx_fav_turf (turf_id)
+      )
+    `);
+  } catch (e) {
+    console.error('⚠️ Failed to ensure user_favourite_turfs table:', e.message);
+  }
+}
+ensureFavouritesTable();
+
 async function ensureContactMessagesTable() {
   try {
     await pool.query(`
@@ -283,7 +305,10 @@ ensureRouteSplitSchema()
 const ensureActivitiesSchema = require('./migrate_activities');
 // the global layer alters turfs/bookings/activities, so it runs after the activities tables exist
 const ensureGlobalSchema = require('./migrate_global');
-ensureActivitiesSchema().catch(err => console.error('Activities migration error:', err.message)).then(() => ensureGlobalSchema())
+ensureActivitiesSchema().catch(err => console.error('Activities migration error:', err.message))
+  // multi-ticket columns used by ticket issuing + QR redemption (redeemed_quantity, product_type, ...); schema only
+  .then(() => require('./migrate_activities_and_tickets')())
+  .then(() => ensureGlobalSchema())
   // after the notification schema (which defines the original status enum) and the global layer
   .then(() => require('./migrate_subscriptions')())
   .then(() => require('./migrate_onboarding_and_approvals')())
@@ -403,45 +428,12 @@ app.use('/api/rankings', require('./routes/rankings'));
 app.use('/api/ads', require('./routes/ads'));
 app.use('/api/admin-ads', require('./routes/admin-ads'));
 
-// ✅ Standalone Email endpoint — works even when DB is in demo/mock mode
-const { sendEmail } = require('./utils/email');
-app.post('/api/notify/booking', async (req, res) => {
-  try {
-    const { customer_email, customer_name, turf_name, booking_date, time_slot, amount, service_fee, discount_amount } = req.body;
-
-    if (!customer_email) {
-      return res.status(400).json({ error: 'Email address is required' });
-    }
-
-    let msg = `✅ Booking Confirmed!\n\nHi ${customer_name}, your slot at **${turf_name}** is officially booked.\n\n📅 Date: ${booking_date}\n⏰ Time: ${time_slot}\n\n💰 **Price Breakdown:**\n`;
-
-    if (discount_amount > 0) msg += `   - Base Price: ₹${parseFloat(amount) + parseFloat(discount_amount) - (parseFloat(service_fee) || 0)}\n   - Discount: -₹${discount_amount}\n`;
-    if (service_fee > 0) msg += `   - Service Fee: +₹${service_fee}\n`;
-
-    msg += `\n✨ **Total Paid: ₹${amount}**\n\nThank you for choosing Book Arena! 🏟️`;
-
-    // Never send booking confirmations to the admin mailbox.
-    const adminEmails = new Set(
-      [process.env.ADMIN_EMAIL, process.env.EMAIL_USER]
-        .map(v => String(v || '').trim().toLowerCase())
-        .filter(Boolean)
-    );
-    const toKey = String(customer_email || '').trim().toLowerCase();
-    if (adminEmails.has(toKey)) {
-      return res.json({ success: true, message: 'Admin recipient suppressed' });
-    }
-
-    const result = await sendEmail(customer_email, 'Booking Confirmed - Book Arena', msg);
-
-    if (result.success) {
-      res.json({ success: true, message: 'Confirmation Email sent!' });
-    } else {
-      res.json({ success: false, message: result.error || result.message || 'Email not sent' });
-    }
-  } catch (err) {
-    console.error('Notify error:', err.message);
-    res.status(500).json({ error: 'Failed to send notification' });
-  }
+// Booking confirmation emails are sent by the server itself after the payment is verified (routes/bookings.js
+// sendBookingConfirmationEmails). This public endpoint used to email ANY address with caller-supplied text from our
+// mailbox (an open relay for fake "Booking Confirmed" mails, and a duplicate mail for real customers). It is kept so
+// older website builds that still call it get a harmless 200, but it no longer sends anything.
+app.post('/api/notify/booking', (req, res) => {
+  res.json({ success: true, skipped: true, message: 'Confirmation emails are sent automatically after payment verification.' });
 });
 
 

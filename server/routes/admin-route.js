@@ -208,4 +208,32 @@ router.get('/audit', async (req, res) => {
   } catch (e) { console.error('admin route audit:', e.message); bad(res, 500, 'Could not load the audit log'); }
 });
 
+// POST /api/admin/route/turfs/:id/reconcile — CHECK this venue's paid bookings of the last 30 days against Razorpay and
+// the transfer ledger. Read-only: it never moves money. Payments that still need an owner transfer (or a retry) are
+// listed so the admin can act on each one in Finance → Payment lookup, which shows the details and asks for confirmation.
+router.post('/turfs/:id/reconcile', async (req, res) => {
+  try {
+    const turfId = parseInt(req.params.id, 10);
+    const [[turf]] = await pool.query('SELECT id, name FROM turfs WHERE id = ?', [turfId]);
+    if (!turf) return res.status(404).json({ error: 'Venue not found' });
+    const [pays] = await pool.query(
+      `SELECT DISTINCT payment_id FROM bookings
+       WHERE turf_id = ? AND payment_status = 'success' AND payment_id LIKE 'pay\\_%' AND created_at >= NOW() - INTERVAL 30 DAY
+       ORDER BY payment_id DESC LIMIT 50`, [turfId]);
+    const recon = require('../services/paymentReconciliation');
+    const needsAction = []; const unreadable = [];
+    for (const { payment_id: pid } of pays) {
+      const r = await recon.inspectPayment(pid);
+      if (r.error) { unreadable.push({ payment_id: pid, error: r.error }); continue; }
+      if (r.action && r.action.type !== 'none') needsAction.push({ payment_id: pid, action: r.action.type, amount_minor: r.action.amount_minor, reason: r.action.reason });
+      else if (r.issues && r.issues.length) needsAction.push({ payment_id: pid, action: 'review', reason: r.issues.join(' ') });
+    }
+    await recon.logAction({ adminId: req.user.id, action: 'turf_reconcile_scan', paymentId: null, turfId, outcome: needsAction.length ? 'needs_action' : 'ok', details: { scanned: pays.length, needs_action: needsAction.length } }).catch(() => {});
+    res.json({ success: true, venue: turf.name, scanned: pays.length, updated: 0, needs_action: needsAction, unreadable });
+  } catch (err) {
+    console.error('turf reconcile scan:', err.message);
+    res.status(500).json({ error: 'Could not check this venue\'s payments' });
+  }
+});
+
 module.exports = router;

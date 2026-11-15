@@ -20,13 +20,15 @@ const { labelsConflict } = require('./slotSchedule');
  * @param {Object} [params.dbConn] - Optional database connection/transaction
  * @returns {Promise<{available: boolean, reason?: string, message?: string, bookingDetails?: Object}>}
  */
-async function checkSingleSlotAvailability({ turfId, courtId = null, date, timeSlot, excludeBookingId = null, dbConn = pool }) {
+// paidOnly: ignore unpaid 15-minute holds (used when a PAYMENT is being confirmed: only paid bookings, owner blocks and
+// subscriptions can take a slot away from it). skipVenueStatus: don't refuse because the venue was blocked meanwhile.
+async function checkSingleSlotAvailability({ turfId, courtId = null, date, timeSlot, excludeBookingId = null, dbConn = pool, paidOnly = false, skipVenueStatus = false }) {
   const normalizedTurfId = Number(turfId);
   const normalizedCourtId = courtId ? Number(courtId) : null;
   const normalizedSlot = String(timeSlot || '').trim();
 
   // 0. Check if Turf itself is BLOCKED or inactive
-  const [turfRows] = await dbConn.query('SELECT status, is_active, is_deleted FROM turfs WHERE id = ?', [normalizedTurfId]);
+  const [turfRows] = skipVenueStatus ? [[]] : await dbConn.query('SELECT status, is_active, is_deleted FROM turfs WHERE id = ?', [normalizedTurfId]);
   if (turfRows.length > 0) {
     const turf = turfRows[0];
     if (turf.is_deleted || turf.status === 'BLOCKED' || turf.is_active === 0 || turf.is_active === false) {
@@ -45,8 +47,8 @@ async function checkSingleSlotAvailability({ turfId, courtId = null, date, timeS
     WHERE turf_id = ? AND booking_date = ?
     AND (
       (payment_status = 'success' AND status != 'cancelled')
-      OR
-      (payment_status = 'pending' AND status = 'pending' AND created_at > NOW() - INTERVAL 15 MINUTE)
+      ${paidOnly ? '' : `OR
+      (payment_status = 'pending' AND status = 'pending' AND created_at > NOW() - INTERVAL 15 MINUTE)`}
     )
   `;
   const bookingParams = [normalizedTurfId, date];

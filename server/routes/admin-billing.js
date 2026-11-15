@@ -55,7 +55,7 @@ router.get('/overview', async (req, res) => {
   try {
     const one = async (sql, params = []) => (await pool.query(sql, params))[0][0] || {};
     const [venues, owners, bookingCounts] = await Promise.all([
-      one(`SELECT COUNT(*) AS total, SUM(approval_status = 'APPROVED') AS approved, SUM(approval_status IN ('PENDING_APPROVAL','ACTION_REQUIRED')) AS pending FROM turfs`),
+      one(`SELECT COUNT(*) AS total, SUM(approval_status = 'APPROVED') AS approved, SUM(approval_status IN ('PENDING_APPROVAL','ACTION_REQUIRED')) AS pending FROM turfs WHERE (is_deleted IS NULL OR is_deleted = 0)`),
       one('SELECT COUNT(*) AS total FROM owners'),
       one(`SELECT COUNT(*) AS total FROM bookings WHERE payment_status = 'success' AND status = 'confirmed'`),
     ]);
@@ -128,7 +128,7 @@ router.get('/overview', async (req, res) => {
        FROM bookings b JOIN turfs t ON t.id = b.turf_id WHERE b.payment_status IN ('success','pending','failed') ORDER BY b.id DESC LIMIT 8`);
     const [pendingApprovals] = await pool.query(
       `SELECT t.id, t.name, t.approval_status, o.name AS owner_name, t.created_at FROM turfs t LEFT JOIN owners o ON o.id = t.owner_id
-       WHERE t.approval_status IN ('PENDING_APPROVAL','ACTION_REQUIRED') ORDER BY t.created_at DESC LIMIT 6`);
+       WHERE t.approval_status IN ('PENDING_APPROVAL','ACTION_REQUIRED') AND (t.is_deleted IS NULL OR t.is_deleted = 0) ORDER BY t.created_at DESC LIMIT 6`);
     const [attention] = await pool.query(
       `SELECT r.id, r.status, r.razorpay_payment_id, r.error_message, r.created_at, t.name AS turf_name, t.id AS turf_id, COALESCE(r.owner_transfer_minor, 0) AS owner_minor, COALESCE(r.currency, 'INR') AS currency
        FROM route_split_transfers r JOIN turfs t ON t.id = r.turf_id WHERE r.status IN ('FAILED','RETRY_REQUIRED','PENDING','PROCESSING') ORDER BY r.id DESC LIMIT 8`);

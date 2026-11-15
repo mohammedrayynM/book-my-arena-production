@@ -66,7 +66,9 @@ async function lockVenue(turfId) {
   try { await conn.beginTransaction(); await conn.query('SELECT id FROM turfs WHERE id = ? FOR UPDATE', [turfId]); }
   catch (e) { try { await conn.rollback(); } catch (x) { /* ignore */ } conn.release(); throw e; }
   let done = false;
-  return { release: async () => { if (done) return; done = true; try { await conn.commit(); } finally { conn.release(); } } };
+  // conn: the locked transaction, so a caller can write the rows it is deciding about inside the same lock (a write on another
+  // connection that needs a foreign-key check against the locked venue row would otherwise wait on this very lock).
+  return { conn, release: async () => { if (done) return; done = true; try { await conn.commit(); } finally { conn.release(); } } };
 }
 
 module.exports = { lockVenue, SLOT_MESSAGE, toMinutes, ymdOf, dayOfWeek, addMonthsClamped, addDays, parseWeekdays, weekdaysCsv, occurrencesBetween, overlaps, reservedRangesForDate, slotReserved };

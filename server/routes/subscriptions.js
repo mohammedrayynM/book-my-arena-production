@@ -299,7 +299,9 @@ router.post('/purchase', requireCustomer, async (req, res) => {
       if (r.conflict) return fail(res, 409, 'This slot is no longer available.', { code: 'SLOT_UNAVAILABLE' });
       return res.json({ success: true, skipPayment: true, message: 'Subscription successfully activated without payment.', subscription_id: r.subscriptionId });
     }
-    res.json({ success: true, order_id: r.orderId, amount: r.amountMinor, currency: r.currency, subscription_id: r.subscriptionId, reused: !!r.reused });
+    // key_id is the PUBLIC Razorpay key id (never the secret). Every other checkout returns it; without it the app's native
+    // checkout opened with `key: undefined` and failed immediately, and the website fell through to an undefined env var.
+    res.json({ success: true, order_id: r.orderId, amount: r.amountMinor, currency: r.currency, key_id: process.env.RAZORPAY_KEY_ID, subscription_id: r.subscriptionId, reused: !!r.reused });
   } catch (err) { console.error(err); fail(res, 500, 'Failed to initiate purchase'); }
 });
 
@@ -405,7 +407,7 @@ router.post('/:id/renew', requireCustomer, async (req, res) => {
     if (!isId(req.params.id)) return fail(res, 404, 'Subscription not found');
     const r = await subs.renewalOrder({ userId: req.user.id, subscriptionId: Number(req.params.id) });
     if (r.error) return fail(res, r.status || 400, r.error);
-    res.json({ success: true, order_id: r.orderId, amount: r.amountMinor, currency: r.currency, subscription_id: r.subscriptionId, reused: !!r.reused });
+    res.json({ success: true, order_id: r.orderId, amount: r.amountMinor, currency: r.currency, key_id: process.env.RAZORPAY_KEY_ID, subscription_id: r.subscriptionId, reused: !!r.reused });
   } catch (err) { console.error(err); fail(res, 500, 'Failed to start the renewal'); }
 });
 

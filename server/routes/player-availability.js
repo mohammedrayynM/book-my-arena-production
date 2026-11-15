@@ -249,8 +249,10 @@ router.post('/invite', async (req, res) => {
 });
 
 // 7. Get invites for a player (by user_id via join to availability)
-router.get('/invites/user/:user_id', async (req, res) => {
+// A player's own invites only (was readable for any user id without signing in).
+router.get('/invites/user/:user_id', verifyToken, async (req, res) => {
   try {
+    if (req.user.role || Number(req.params.user_id) !== Number(req.user.id)) return res.status(403).json({ error: 'You can only view your own invites' });
     const [invites] = await pool.query(`
       SELECT pi.*, pr.sport_type, pr.match_date, pr.match_time, pr.turf_id, pr.host_id, pa.user_id as player_user_id, pa.role as player_role, u.name as host_name, t.name as turf_name
       FROM player_invites pi

@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 const { sendEmail } = require('../utils/email');
-const { verifyToken, optionalAuth } = require('../middleware/auth');
+const { verifyToken, verifyCustomer, verifyAdmin, optionalAuth } = require('../middleware/auth');
 const matchJoin = require('../services/matchJoin');
 const { inviteUrl } = require('../services/publicUrl');
 const routeProvider = require('../services/routeProvider');
@@ -740,10 +740,12 @@ router.post('/join/hosted/verify', async (req, res) => {
 });
 
 // The player closed the payment window: release the held spot straight away (it would also simply expire). Never touches a paid row.
-router.post('/join/hosted/cancel', async (req, res) => {
+// The hosted checkout page sends the customer's token; only THEIR OWN unpaid seat hold is released (anyone could release
+// anyone's hold before). Always answers success so the checkout page can navigate back either way.
+router.post('/join/hosted/cancel', optionalAuth, async (req, res) => {
   try {
     const id = parseInt((req.body || {}).booking_id, 10);
-    if (id) await pool.query("UPDATE match_players SET reserved_until = NULL WHERE id = ? AND payment_status = 'pending'", [id]);
+    if (id && req.user && !req.user.role) await pool.query("UPDATE match_players SET reserved_until = NULL WHERE id = ? AND user_id = ? AND payment_status = 'pending'", [id, req.user.id]);
     res.json({ success: true });
   } catch (err) { res.json({ success: true }); }
 });
@@ -783,8 +785,14 @@ router.get('/mine', verifyToken, async (req, res) => {
 });
 
 // 1. Create a player request
-router.post('/create', async (req, res) => {
+// Signed-in customer only; the host is ALWAYS the signed-in user (a host_id in the body used to let anyone create
+// matches in someone else's name).
+router.post('/create', verifyCustomer, async (req, res) => {
   try {
+    req.body = { ...(req.body || {}), host_id: req.user.id };
+    if (!req.body.turf_id || !req.body.match_date || !req.body.match_time || !req.body.sport_type) {
+      return res.status(400).json({ error: 'Venue, sport, date and time are required' });
+    }
     const {
       host_id, turf_id, court_id, sport_type, match_type, match_date, match_time,
       total_slots, filled_slots, roles_needed, skill_level, advance_amount,
@@ -969,7 +977,7 @@ router.post('/join', verifyToken, async (req, res) => {
 // SPECIFIC ROUTES (BEFORE GENERIC /:id)
 
 // Get admin stats
-router.get('/admin/stats', async (req, res) => {
+router.get('/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const [[stats]] = await pool.query(`
       SELECT
@@ -1039,15 +1047,15 @@ router.get('/:id', async (req, res) => {
 });
 
 // 6. Edit a match request
-router.put('/:id', async (req, res) => {
+router.put('/:id', verifyToken, async (req, res) => {
   try {
-    const { total_slots, roles_needed, advance_amount, split_amount, visibility_radius, host_id } = req.body;
+    const { total_slots, roles_needed, advance_amount, split_amount, visibility_radius } = req.body;
     const matchId = req.params.id;
 
-    // Verify ownership
+    // Verify ownership against the TOKEN (the host_id the request body carried could be anyone's)
     const [[match]] = await pool.query('SELECT host_id FROM player_requests WHERE id = ?', [matchId]);
     if (!match) return res.status(404).json({ error: 'Match not found' });
-    if (match.host_id !== parseInt(host_id)) {
+    if (req.user.role !== 'admin' && (req.user.role || Number(match.host_id) !== Number(req.user.id))) {
       return res.status(403).json({ error: 'Not authorized to edit this match' });
     }
 
@@ -1072,18 +1080,18 @@ router.put('/:id', async (req, res) => {
 });
 
 // 7. Cancel a match request
-router.delete('/:id', verifyToken, async (req, res) => {
-  if (req.user.role) return res.status(403).json({ error: 'This action is for customer accounts' });
+// Cancel a match request and tell everyone who joined. hostId = the signed-in host (null when an admin removes it).
+async function cancelMatchRequest(req, res, hostId) {
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
     const matchId = req.params.id;
-    const host_id = req.user.id;
 
-    // Verify ownership
-    const [[match]] = await connection.query('SELECT host_id FROM player_requests WHERE id = ?', [matchId]);
-    if (!match) return res.status(404).json({ error: 'Match not found' });
-    if (match.host_id !== parseInt(host_id)) {
+    // Verify ownership (an admin may remove any match)
+    const [[match]] = await connection.query('SELECT host_id FROM player_requests WHERE id = ? FOR UPDATE', [matchId]);
+    if (!match) { await connection.rollback(); return res.status(404).json({ error: 'Match not found' }); }
+    if (hostId != null && Number(match.host_id) !== Number(hostId)) {
+      await connection.rollback();
       return res.status(403).json({ error: 'Not authorized to cancel this match' });
     }
 
@@ -1116,7 +1124,16 @@ router.delete('/:id', verifyToken, async (req, res) => {
   } finally {
     connection.release();
   }
+}
+
+// The host cancels their own match
+router.delete('/:id', verifyToken, (req, res) => {
+  if (req.user.role) return res.status(403).json({ error: 'This action is for customer accounts' });
+  return cancelMatchRequest(req, res, req.user.id);
 });
+
+// An admin removes any match (website admin dashboard → Matches → Remove)
+router.delete('/admin/:id', verifyToken, verifyAdmin, (req, res) => cancelMatchRequest(req, res, null));
 
 // 8. Approve a player
 router.put('/:id/approve-player', verifyToken, async (req, res) => {
@@ -1211,11 +1228,10 @@ router.put('/:id/reject-player', verifyToken, async (req, res) => {
 });
 
 // 11. Feature a match (admin only)
-router.put('/:id/feature', async (req, res) => {
+// Admin only (was open to anyone).
+router.put('/:id/feature', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const { featured } = req.body;
-
-    // In production, verify admin role here
     await pool.query('UPDATE player_requests SET is_featured = ? WHERE id = ?', [featured, req.params.id]);
 
     res.json({ success: true, message: `Match ${featured ? 'featured' : 'unfeatured'}` });
@@ -1226,7 +1242,8 @@ router.put('/:id/feature', async (req, res) => {
 });
 
 // 12. Broadcast notification about a match (admin only)
-router.post('/:id/broadcast', async (req, res) => {
+// Admin only: this emails up to 100 users, so it must never be callable without an admin token (it was open to anyone).
+router.post('/:id/broadcast', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const matchId = req.params.id;
 

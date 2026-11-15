@@ -576,6 +576,9 @@ router.put('/turfs/:id', verifyToken, verifyOwner, async (req, res) => {
       return res.status(403).json({ error: 'You do not own this turf' });
     }
 
+    if (!String(req.body.name || '').trim() || !String(req.body.location || '').trim()) {
+      return res.status(400).json({ error: 'Venue name and location are required' });
+    }
     const { name, location, address, sport_type: sport_type_in, price_per_hour, description, images, photos, coverImage, photosCount, amenities, is_active, open_time, close_time, markup_type, markup_value, slot_duration, time_format, advance_percent, latitude, longitude, default_price, early_morning_price, morning_price, afternoon_price, evening_price, owner_email, place_id, postal_code, city } = req.body;
     const sportSel = await venueSports.resolveSelection(req.body);
     if (sportSel.error) return res.status(400).json({ error: sportSel.error });
@@ -689,17 +692,15 @@ router.delete('/turfs/:id/remove-image', verifyToken, verifyOwner, async (req, r
   }
 });
 
-// DELETE /api/owners/turfs/:id — Delete a turf
+// DELETE /api/owners/turfs/:id — Delete (archive) the owner's own turf. A hard DELETE used to cascade into the venue's
+// bookings and payments; archiving keeps that history and hides the venue everywhere (services/venueArchive.js).
 router.delete('/turfs/:id', verifyToken, verifyOwner, async (req, res) => {
   try {
-    const [turfCheck] = await pool.query('SELECT owner_id FROM turfs WHERE id = ?', [req.params.id]);
-    if (turfCheck.length === 0 || turfCheck[0].owner_id !== req.user.id) {
-      return res.status(403).json({ error: 'You do not own this turf' });
-    }
-
-    await pool.query('DELETE FROM turfs WHERE id = ? AND owner_id = ?', [req.params.id, req.user.id]);
-    res.json({ success: true, message: 'Turf deleted successfully' });
+    const { archiveVenue } = require('../services/venueArchive');
+    const r = await archiveVenue({ turfId: req.params.id, actor: { role: 'owner', id: req.user.id }, ownerId: req.user.id });
+    res.status(r.status).json(r.body);
   } catch (err) {
+    console.error('Error deleting owner turf:', err);
     res.status(500).json({ error: 'Failed to delete turf' });
   }
 });
@@ -1421,6 +1422,50 @@ router.get('/bookings', verifyToken, verifyOwner, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 
 // GET /api/owners/turfs/:id/special-pricing — Get all special pricing for a turf
+// ---- Turf sessions (named time bands such as Morning / Evening that group slots on the booking screen) ----
+// The website's owner dashboard and the app call these; they did not exist (404). Labels only: they never block slots.
+async function ownsTurf(ownerId, turfId) {
+  const [[t]] = await pool.query('SELECT owner_id FROM turfs WHERE id = ? AND (is_deleted IS NULL OR is_deleted = 0)', [turfId]);
+  return !!t && Number(t.owner_id) === Number(ownerId);
+}
+const HHMM = /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/;
+
+router.get('/turfs/:id/sessions', verifyToken, verifyOwner, async (req, res) => {
+  try {
+    if (!(await ownsTurf(req.user.id, req.params.id))) return res.status(403).json({ error: 'You do not own this turf' });
+    const [rows] = await pool.query('SELECT id, turf_id, court_id, name, start_time, end_time, is_enabled FROM turf_sessions WHERE turf_id = ? ORDER BY start_time ASC', [req.params.id]);
+    res.json({ sessions: rows });
+  } catch (err) { console.error('owner sessions:', err.message); res.status(500).json({ error: 'Failed to fetch sessions' }); }
+});
+
+router.post('/turfs/:id/sessions', verifyToken, verifyOwner, async (req, res) => {
+  try {
+    if (!(await ownsTurf(req.user.id, req.params.id))) return res.status(403).json({ error: 'You do not own this turf' });
+    const name = String((req.body || {}).name || '').trim();
+    const start = String(req.body.start_time || ''), end = String(req.body.end_time || '');
+    if (!name || name.length > 100) return res.status(400).json({ error: 'Session name is required (max 100 characters)' });
+    if (!HHMM.test(start) || !HHMM.test(end)) return res.status(400).json({ error: 'Start and end time must be HH:MM' });
+    if (start.slice(0, 5) >= end.slice(0, 5)) return res.status(400).json({ error: 'End time must be after start time' });
+    const courtId = req.body.court_id ? Number(req.body.court_id) : null;
+    if (courtId) {
+      const [[c]] = await pool.query('SELECT id FROM courts WHERE id = ? AND turf_id = ?', [courtId, req.params.id]);
+      if (!c) return res.status(400).json({ error: 'That court does not belong to this venue' });
+    }
+    const [r] = await pool.query('INSERT INTO turf_sessions (turf_id, court_id, name, start_time, end_time, is_enabled) VALUES (?, ?, ?, ?, ?, ?)',
+      [req.params.id, courtId, name, start, end, req.body.is_enabled === false ? 0 : 1]);
+    res.json({ success: true, id: r.insertId });
+  } catch (err) { console.error('owner add session:', err.message); res.status(500).json({ error: 'Failed to add session' }); }
+});
+
+router.delete('/turfs/:id/sessions/:sessionId', verifyToken, verifyOwner, async (req, res) => {
+  try {
+    if (!(await ownsTurf(req.user.id, req.params.id))) return res.status(403).json({ error: 'You do not own this turf' });
+    const [r] = await pool.query('DELETE FROM turf_sessions WHERE id = ? AND turf_id = ?', [req.params.sessionId, req.params.id]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'Session not found' });
+    res.json({ success: true });
+  } catch (err) { console.error('owner delete session:', err.message); res.status(500).json({ error: 'Failed to delete session' }); }
+});
+
 router.get('/turfs/:id/special-pricing', verifyToken, verifyOwner, async (req, res) => {
   try {
     // Verify owner owns the turf

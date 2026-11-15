@@ -17,7 +17,8 @@ const VALID_PLACEMENTS = [
   'RESULT_PAGE'
 ];
 
-// Configure Multer storage for Ad Images
+// Configure Multer storage for Ad Images (same rules as venue / sport images: JPEG, PNG, WEBP; content checked by magic bytes)
+const { ALLOWED_IMAGE_EXTS, isAllowedImageUploadMeta, ensureUploadedImageExt } = require('../utils/imageUpload');
 const uploadDir = path.join(__dirname, '../uploads/ads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -28,40 +29,50 @@ const storage = multer.diskStorage({
     cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    const safeExt = ALLOWED_IMAGE_EXTS.has(ext) ? ext : '.jpg'; // corrected from the real content after upload
     const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-    cb(null, `ad-${uniqueSuffix}${ext}`);
+    cb(null, `ad-${uniqueSuffix}${safeExt}`);
   }
 });
-
-const fileFilter = (req, file, cb) => {
-  const allowedExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg'];
-  const ext = path.extname(file.originalname).toLowerCase();
-  const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'];
-
-  if (allowedExts.includes(ext) || allowedMimeTypes.includes(file.mimetype)) {
-    cb(null, true);
-  } else {
-    cb(new Error('Invalid image file format. Supported: JPG, PNG, WEBP, GIF, SVG'));
-  }
-};
 
 const upload = multer({
   storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB limit
-  fileFilter
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 }, // 10 MB limit
+  fileFilter: (req, file, cb) => {
+    if (isAllowedImageUploadMeta(file.originalname, file.mimetype)) return cb(null, true);
+    // SVG/GIF are no longer accepted: SVG can carry script and is served from our own origin
+    cb(Object.assign(new Error('Only JPG, JPEG, PNG and WEBP images are allowed'), { status: 415 }));
+  }
 });
 
+// multer errors (size, format, malformed multipart) become clear 4xx JSON answers instead of the global 500
+function handleAdUpload(req, res, next) {
+  upload.single('image')(req, res, (err) => {
+    if (!err) return next();
+    if (req.file?.path && fs.existsSync(req.file.path)) { try { fs.unlinkSync(req.file.path); } catch (e) { /* ignore */ } }
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ success: false, error: 'Image must be 10 MB or smaller' });
+      if (err.code === 'LIMIT_UNEXPECTED_FILE') return res.status(400).json({ success: false, error: 'Send the image in the "image" field' });
+      return res.status(400).json({ success: false, error: err.message });
+    }
+    return res.status(err.status || 400).json({ success: false, error: err.message || 'Upload failed' });
+  });
+}
+
 // POST /api/admin-ads/upload - Upload ad image file
-router.post('/upload', verifyToken, verifyAdmin, upload.single('image'), (req, res) => {
+router.post('/upload', verifyToken, verifyAdmin, handleAdUpload, (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No image file uploaded' });
     }
+    const checked = ensureUploadedImageExt(req.file); // deletes the file if it is not really a JPEG/PNG/WEBP
+    if (!checked.ok) return res.status(415).json({ success: false, error: checked.error });
     const relativeUrl = `/api/uploads/ads/${req.file.filename}`;
     res.json({ success: true, url: relativeUrl, filename: req.file.filename });
   } catch (error) {
     console.error('Ad image upload error:', error);
+    if (req.file?.path && fs.existsSync(req.file.path)) { try { fs.unlinkSync(req.file.path); } catch (e) { /* ignore */ } }
     res.status(500).json({ success: false, error: 'Failed to upload image' });
   }
 });

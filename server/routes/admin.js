@@ -36,7 +36,7 @@ router.post('/login', async (req, res) => {
 router.get('/dashboard', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const [totalUsers] = await pool.query("SELECT COUNT(DISTINCT customer_phone) as count FROM bookings WHERE payment_status = 'success'");
-    const [totalTurfs] = await pool.query('SELECT COUNT(*) as count FROM turfs');
+    const [totalTurfs] = await pool.query('SELECT COUNT(*) as count FROM turfs WHERE (is_deleted IS NULL OR is_deleted = 0)');
     const [totalBookings] = await pool.query("SELECT COUNT(*) as count FROM bookings WHERE payment_status = 'success'");
     const [totalOwners] = await pool.query('SELECT COUNT(*) as count FROM owners');
     const [totalRevenueResult] = await pool.query(
@@ -117,6 +117,7 @@ router.get('/turfs', verifyToken, verifyAdmin, async (req, res) => {
         AND MONTH(booking_date) = MONTH(CURDATE()) AND YEAR(booking_date) = YEAR(CURDATE())
         GROUP BY turf_id
       ) m ON t.id = m.turf_id
+      WHERE (t.is_deleted IS NULL OR t.is_deleted = 0)
       ORDER BY t.created_at DESC
     `);
     const turfs = rows.map(t => ({
@@ -161,6 +162,9 @@ router.post('/turfs', verifyToken, verifyAdmin, async (req, res) => {
 router.put('/turfs/:id', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const { name, location, address, sport_type, price_per_hour, description, images, amenities, is_active, open_time, close_time, owner_email, monthly_subscription_amount, razorpay_linked_account_id } = req.body;
+    if (!String(name || '').trim() || !String(location || '').trim()) {
+      return res.status(400).json({ error: 'Venue name and location are required' });
+    }
 
     // Billing is NOT edited here any more: monthly_subscription_amount (and every other price) now lives in the versioned,
     // audited billing configuration, so a venue edit can no longer overwrite it (it used to reset it to 0 when omitted).
@@ -200,6 +204,21 @@ router.put('/turfs/:id/billing', verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
+// DELETE /api/admin/turfs/:id — remove a venue (admin only). The venue is ARCHIVED, not hard-deleted, so its bookings,
+// payments, refunds and payouts stay intact (services/venueArchive.js). If it still has upcoming paid bookings or active
+// subscriptions the first call answers 409 with the numbers; the admin confirms and the app retries with ?force=1.
+router.delete('/turfs/:id', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { archiveVenue } = require('../services/venueArchive');
+    const force = ['1', 'true'].includes(String(req.query.force || '').toLowerCase()) || (req.body && req.body.force === true);
+    const r = await archiveVenue({ turfId: req.params.id, actor: { role: 'admin', id: req.user.id }, force });
+    res.status(r.status).json(r.body);
+  } catch (err) {
+    console.error('Error deleting venue:', err);
+    res.status(500).json({ success: false, error: 'Failed to delete the venue' });
+  }
+});
+
 // PUT /api/admin/turfs/:id/status — Block/unblock venue (admin only)
 router.put('/turfs/:id/status', verifyToken, verifyAdmin, async (req, res) => {
   try {
@@ -226,7 +245,7 @@ router.get('/pending-approvals', verifyToken, verifyAdmin, async (req, res) => {
       `SELECT t.*, o.name as owner_name, o.email as owner_email, o.phone as owner_phone
        FROM turfs t
        JOIN owners o ON t.owner_id = o.id
-       WHERE t.approval_status IN ('PENDING_APPROVAL', 'ACTION_REQUIRED')
+       WHERE t.approval_status IN ('PENDING_APPROVAL', 'ACTION_REQUIRED') AND (t.is_deleted IS NULL OR t.is_deleted = 0)
        ORDER BY t.created_at DESC`
     );
 
@@ -604,11 +623,22 @@ router.get('/turfs/:id/earnings', verifyToken, verifyAdmin, async (req, res) => 
   }
 });
 
-// DELETE /api/admin/turfs/:id/bookings - Delete all bookings for a specific turf
+// DELETE /api/admin/turfs/:id/bookings — clear a venue's ABANDONED booking attempts (unpaid holds, failed or cancelled
+// attempts where no money was ever taken). Paid, confirmed and refunded bookings are financial records and are always kept
+// (this used to hard-delete every booking of the venue, payments included).
 router.delete('/turfs/:id/bookings', verifyToken, verifyAdmin, async (req, res) => {
   try {
-    await pool.query('DELETE FROM bookings WHERE turf_id = ?', [req.params.id]);
-    res.json({ success: true, message: 'All bookings for this turf deleted successfully' });
+    const noMoney = `turf_id = ? AND payment_status <> 'success' AND status IN ('pending', 'cancelled')
+      AND (payment_id IS NULL OR payment_id NOT LIKE 'pay\\_%')
+      AND created_at < NOW() - INTERVAL 30 MINUTE`;
+    let refundCheck = '';
+    try { await pool.query('SELECT 1 FROM refunds LIMIT 1'); refundCheck = " AND id NOT IN (SELECT booking_id FROM refunds WHERE booking_type IN ('turf', 'booking'))"; } catch (e) { /* no refunds table */ }
+    const [del] = await pool.query(`DELETE FROM bookings WHERE ${noMoney}${refundCheck}`, [req.params.id]);
+    const [[kept]] = await pool.query('SELECT COUNT(*) AS n FROM bookings WHERE turf_id = ?', [req.params.id]);
+    res.json({
+      success: true, removed: del.affectedRows, kept: Number(kept.n),
+      message: `Removed ${del.affectedRows} abandoned booking attempt(s). ${kept.n} booking(s) with payment or confirmation history were kept.`,
+    });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete turf bookings' });
   }

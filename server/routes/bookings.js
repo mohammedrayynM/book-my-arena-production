@@ -227,6 +227,21 @@ async function checkSlotsAvailable({ turfId, courtId, bookingDate, targetSlots }
   return { ok: true };
 }
 
+// At PAYMENT time: is any of these booking rows' slot already taken by a PAID booking, an owner block or an active
+// subscription? Same rules as the availability customers see (time-range overlap, whole-venue vs court) — the old check only
+// matched the exact same slot text on the exact same court, so a late payment could still confirm a 6-7 PM booking over a paid
+// 6:30-7 PM one, or a whole-venue booking over a paid court booking. Unpaid holds don't count here: first payment wins.
+async function paidSlotConflict(rows, ownIds) {
+  for (const b of rows) {
+    const r = await availabilityService.checkSingleSlotAvailability({
+      turfId: b.turf_id, courtId: b.court_id || null, date: b.booking_date, timeSlot: b.time_slot,
+      excludeBookingId: ownIds, paidOnly: true, skipVenueStatus: true,
+    });
+    if (!r.available) return true;
+  }
+  return false;
+}
+
 function formatCurrency(value) {
   const amount = Number(value || 0);
   return `₹${amount.toLocaleString('en-IN', {
@@ -723,7 +738,9 @@ router.post('/', verifyCustomer, async (req, res) => {
     let feeRuleId = null;
     let feeRuleSnapshot = null;
     try {
-      const activeFeeRule = await billingConfig.getActiveFeeRule(turf.country_code || 'IN', venueCurrency, 'VENUE');
+      // turf.currency_code, not venueCurrency: that const is declared further down, so using it here threw a
+      // ReferenceError on EVERY booking and the fee silently fell back to 0 (the price preview did charge it).
+      const activeFeeRule = await billingConfig.getActiveFeeRule(turf.country_code || 'IN', turf.currency_code || 'INR', 'VENUE');
       const feeCalc = billingConfig.calculateCustomerFee(activeFeeRule, priceAfterCoupon);
       serviceFee = feeCalc.serviceFee;
       serviceFeeTax = feeCalc.serviceFeeTax;
@@ -1230,13 +1247,22 @@ router.post('/calculate-price', optionalAuth, async (req, res) => {
 });
 
 // Helper: confirm bookings and auto-create player_request for 'Need Players' bookings
-async function confirmBookings(ids, razorpay_payment_id) {
+// opts.conn: run the confirming UPDATE on the caller's locked venue transaction (see subscriptionReservations.lockVenue).
+// opts.deferFollowUp: return the follow-up work (Find-Players request, notifications) as a function to run AFTER the venue
+// lock is released, instead of doing it while the lock is held.
+async function confirmBookings(ids, razorpay_payment_id, opts = {}) {
   if (!ids || ids.length === 0) return;
   const placeholders = ids.map(() => '?').join(',');
-  await pool.query(
+  await (opts.conn || pool).query(
     `UPDATE bookings SET payment_id = ?, payment_status = 'success', status = 'confirmed' WHERE id IN (${placeholders})`,
     [razorpay_payment_id, ...ids]
   );
+  if (opts.deferFollowUp) return () => afterBookingsConfirmed(ids);
+  await afterBookingsConfirmed(ids);
+}
+
+async function afterBookingsConfirmed(ids) {
+  const placeholders = ids.map(() => '?').join(',');
 
   // Auto-create player_request for 'Need Players' bookings (first booking row)
   try {
@@ -1361,7 +1387,10 @@ router.get('/checkout-html', (req, res) => {
     if (allowEmpty && String(value || '').trim() === '') return '';
     try {
       const url = new URL(String(value || fallback), origin);
-      if (url.origin !== origin || !url.pathname.startsWith('/api/')) return fallback;
+      // Compare the HOST only. Behind the HTTPS proxy req.protocol is 'http', so an absolute https verify_url
+      // (what the app sends for activity tickets / subscriptions) never matched the origin and was silently swapped
+      // for the TURF verify endpoint: the payment was captured but the ticket booking was never confirmed.
+      if (!/^https?:$/.test(url.protocol) || url.host !== req.get('host') || !url.pathname.startsWith('/api/')) return fallback;
       return `${url.pathname}${url.search}`;
     } catch {
       return fallback;
@@ -1663,6 +1692,8 @@ router.post('/verify', verifyCustomer, async (req, res) => {
           return res.status(400).json({ success: false, error: 'Bookings must belong to one venue' });
         }
         const lockedTurfId = bookingsToCheck[0].turf_id;
+        let confirmFollowUp = null;
+        let lostSlot = false;
         const slotLockAcquired = await acquireSlotLock(lockedTurfId);
         if (!slotLockAcquired) {
           return res.status(503).json({ success: false, pending: true, error: 'Payment is verified; your booking is still being finalized. Please check again shortly.' });
@@ -1671,66 +1702,29 @@ router.post('/verify', verifyCustomer, async (req, res) => {
         // Serialize with both new slot creation and subscription activation before checking and confirming.
         const vlock = await subscriptionReservations.lockVenue(lockedTurfId);
         try {
-        let slotConflict = false;
-        for (const b of bookingsToCheck) {
-          // Check if another booking is confirmed for this slot
-          let checkQuery = `
-            SELECT id FROM bookings 
-            WHERE turf_id = ? AND booking_date = ? AND time_slot = ? 
-            AND status != 'cancelled' AND payment_status = 'success' 
-            AND id NOT IN (${placeholders})
-          `;
-          const checkParams = [b.turf_id, b.booking_date, b.time_slot, ...ids];
-          if (b.court_id) {
-            checkQuery += ' AND court_id = ?';
-            checkParams.push(b.court_id);
-          } else {
-            checkQuery += ' AND court_id IS NULL';
-          }
-          const [existing] = await pool.query(checkQuery, checkParams);
-          if (existing.length > 0) {
-            slotConflict = true;
-            break;
-          }
-
-          // Check if slot is blocked by owner
-          const blockedHasCourtId = await hasColumn('blocked_slots', 'court_id');
-          let checkBlockedQuery = 'SELECT id FROM blocked_slots WHERE turf_id = ? AND block_date = ? AND time_slot = ?';
-          const checkBlockedParams = [b.turf_id, b.booking_date, b.time_slot];
-          if (b.court_id && blockedHasCourtId) {
-            checkBlockedQuery += ' AND (court_id IS NULL OR court_id = ?)';
-            checkBlockedParams.push(b.court_id);
-          } else if (!b.court_id && blockedHasCourtId) {
-            checkBlockedQuery += ' AND court_id IS NULL';
-          }
-          const [blocked] = await pool.query(checkBlockedQuery, checkBlockedParams);
-          if (blocked.length > 0) {
-            slotConflict = true;
-            break;
-          }
-
-          // an active subscription holds this slot
-          if (await subscriptionReservations.slotReserved({ turfId: b.turf_id, courtId: b.court_id, date: b.booking_date, slotLabel: b.time_slot })) {
-            slotConflict = true;
-            break;
-          }
-        }
+        const slotConflict = await paidSlotConflict(bookingsToCheck, ids);
 
         if (slotConflict) {
-          // Update these bookings to failed/cancelled since the slot is no longer available
-          await pool.query(
+          // Update these bookings to failed/cancelled since the slot is no longer available (inside the venue lock's
+          // transaction; the refund and notification run after the locks are released, below)
+          await vlock.conn.query(
             `UPDATE bookings SET payment_status = 'failed', status = 'cancelled' WHERE id IN (${placeholders})`,
             [...ids]
           );
+          lostSlot = true;
+        } else {
+          confirmFollowUp = await confirmBookings(ids, razorpay_payment_id, { conn: vlock.conn, deferFollowUp: true });
+        }
+        } finally { if (vlock) await vlock.release(); }
+        } finally { await releaseSlotLock(lockedTurfId); }
+
+        if (lostSlot) {
           fireNotification('booking.failed', { bookingIds: ids, reason: 'slot_unavailable', paymentId: razorpay_payment_id });
           // the customer paid for a slot that is gone: refund in full (idempotent; never blocks this response)
           const conflictRefund = await refundConflictedPayment({ bookingIds: ids, paymentId: razorpay_payment_id });
           return res.status(409).json({ success: false, code: 'SLOT_CONFLICT_REFUNDED', refund_initiated: !!(conflictRefund.refunds && conflictRefund.refunds.length), error: 'Sorry, one or more slots were taken just before your payment completed. Your payment is being refunded in full to your original payment method.' });
         }
-
-        await confirmBookings(ids, razorpay_payment_id);
-        } finally { if (vlock) await vlock.release(); }
-        } finally { await releaseSlotLock(lockedTurfId); }
+        if (confirmFollowUp) await confirmFollowUp();
 
         try {
           const emailResults = await sendBookingConfirmationEmails(ids);
@@ -2123,40 +2117,9 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
         const lockedTurfId = rows[0].turf_id;
         const slotLockAcquired = !slotConflict && await acquireSlotLock(lockedTurfId);
         if (!slotConflict && !slotLockAcquired) throw new Error(`Could not acquire slot lock for captured payment ${payment_id}; webhook will retry`);
+        let webhookFollowUp = null;
         try {
-        for (const booking of rows) {
-          if (slotConflict) break;
-          let checkQuery = `
-            SELECT id FROM bookings 
-            WHERE turf_id = ? AND booking_date = ? AND time_slot = ? 
-            AND status != 'cancelled' AND payment_status = 'success' 
-            AND id NOT IN (${placeholders})
-          `;
-          const checkParams = [booking.turf_id, booking.booking_date, booking.time_slot, ...ids];
-          if (booking.court_id) {
-            checkQuery += ' AND court_id = ?';
-            checkParams.push(booking.court_id);
-          } else {
-            checkQuery += ' AND court_id IS NULL';
-          }
-          const [existing] = await pool.query(checkQuery, checkParams);
-
-          const blockedHasCourtId = await hasColumn('blocked_slots', 'court_id');
-          let checkBlockedQuery = 'SELECT id FROM blocked_slots WHERE turf_id = ? AND block_date = ? AND time_slot = ?';
-          const checkBlockedParams = [booking.turf_id, booking.booking_date, booking.time_slot];
-          if (booking.court_id && blockedHasCourtId) {
-            checkBlockedQuery += ' AND (court_id IS NULL OR court_id = ?)';
-            checkBlockedParams.push(booking.court_id);
-          } else if (!booking.court_id && blockedHasCourtId) {
-            checkBlockedQuery += ' AND court_id IS NULL';
-          }
-          const [blocked] = await pool.query(checkBlockedQuery, checkBlockedParams);
-
-          if (existing.length > 0 || blocked.length > 0 || await subscriptionReservations.slotReserved({ turfId: booking.turf_id, courtId: booking.court_id, date: booking.booking_date, slotLabel: booking.time_slot })) {
-            slotConflict = true;
-            break;
-          }
-        }
+        if (!slotConflict) slotConflict = await paidSlotConflict(rows, ids);
 
         if (!slotConflict) {
           const vlock = await subscriptionReservations.lockVenue(rows[0].turf_id);
@@ -2165,12 +2128,13 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
             for (const booking of rows) {
               if (await subscriptionReservations.slotReserved({ turfId: booking.turf_id, courtId: booking.court_id, date: booking.booking_date, slotLabel: booking.time_slot })) { slotConflict = true; break; }
             }
-            if (!slotConflict) await confirmBookings(ids, payment_id);
+            if (!slotConflict) webhookFollowUp = await confirmBookings(ids, payment_id, { conn: vlock.conn, deferFollowUp: true });
           } finally { await vlock.release(); }
         }
         } finally {
           if (slotLockAcquired) await releaseSlotLock(lockedTurfId);
         }
+        if (webhookFollowUp) await webhookFollowUp();
 
         if (!slotConflict) {
           try {
