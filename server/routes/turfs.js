@@ -655,8 +655,9 @@ router.get('/:idOrSlug/slots', async (req, res) => {
       const exactPrice = offerData.price != null ? parseFloat(offerData.price) : basePriceForThisSlot;
       const hasSpecialPrice = offerData.price != null && exactPrice !== basePriceForThisSlot;
 
-      const { markupAmount, displayPrice } = computeOwnerMarkup(exactPrice, markupType, markupValue, 1);
-
+      // Slot price: exactPrice is the single source of truth for the slot's bookable base price.
+      // displayPrice must always equal exactPrice so that website, mobile app (including existing builds reading displayPrice),
+      // and backend checkout are 100% consistent with no artificial markup or price discrepancies.
       const sMin = slotSchedule.intervalOf(normalizedSlot, scheduleWindow);
       return {
         time: normalizedSlot,
@@ -665,8 +666,8 @@ router.get('/:idOrSlug/slots', async (req, res) => {
         status,
         price: exactPrice,
         basePrice: basePriceForThisSlot,
-        displayPrice,
-        markupAmount,
+        displayPrice: exactPrice,
+        markupAmount: 0,
         hasSpecialPrice,
         offerPercentage: offerData.percentage,
         offerLabel: offerData.label

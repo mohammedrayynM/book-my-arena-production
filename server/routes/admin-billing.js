@@ -767,7 +767,10 @@ router.put('/fee-rules/:id', async (req, res) => {
     const applyTo = b.apply_to || rule.apply_to || 'ALL';
     const showFee = b.show_fee_at_checkout !== undefined ? (b.show_fee_at_checkout ? 1 : 0) : rule.show_fee_at_checkout;
     const isActive = b.is_active !== undefined ? (b.is_active ? 1 : 0) : rule.is_active;
-    await pool.query('UPDATE platform_fee_rules SET apply_to = ?, show_fee_at_checkout = ?, is_active = ? WHERE id = ?', [applyTo, showFee, isActive, id]);
+    const calculationBase = b.calculation_base !== undefined
+      ? (['FULL', 'ONLINE'].includes(String(b.calculation_base).toUpperCase()) ? String(b.calculation_base).toUpperCase() : rule.calculation_base || 'FULL')
+      : (rule.calculation_base || 'FULL');
+    await pool.query('UPDATE platform_fee_rules SET apply_to = ?, show_fee_at_checkout = ?, is_active = ?, calculation_base = ? WHERE id = ?', [applyTo, showFee, isActive, calculationBase, id]);
     const [[updated]] = await pool.query('SELECT * FROM platform_fee_rules WHERE id = ?', [id]);
     res.json({ success: true, rule: updated });
   } catch (e) { handleError(res, e, 'Could not update fee rule'); }

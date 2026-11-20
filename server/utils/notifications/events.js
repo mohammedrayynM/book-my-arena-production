@@ -157,6 +157,26 @@ on('subscription.activated', async ({ subscriptionId, renewal = false }) => {
   if (s.plan_owner_id) {
     await notify({ to: { type: 'owner', id: s.plan_owner_id }, type: 'OWNER_NEW_SUBSCRIPTION', data: f, eventKey: key });
     if (paid) await notify({ to: { type: 'owner', id: s.plan_owner_id }, type: 'OWNER_SUBSCRIPTION_PAYMENT_RECEIVED', data: f, eventKey: key });
+    // Capacity reached notification for the owner
+    try {
+      const [[cap]] = await pool.query(
+        `SELECT COUNT(*) AS active_count, p.max_subscribers, p.name AS plan_name
+         FROM user_subscriptions us JOIN subscription_plans p ON p.id = us.plan_id
+         WHERE us.plan_id = ? AND us.status IN ('active','past_due')
+         GROUP BY p.id`,
+        [s.plan_id]
+      );
+      if (cap && Number(cap.active_count) >= Number(cap.max_subscribers)) {
+        await notify({
+          to: { type: 'owner', id: s.plan_owner_id },
+          type: 'OWNER_SUBSCRIPTION_PLAN_FULL',
+          data: { ...f, maxSubscribers: cap.max_subscribers, planName: cap.plan_name, activeCount: cap.active_count },
+          eventKey: `${s.plan_id}:full:${cap.active_count}`
+        });
+      }
+    } catch (capErr) {
+      console.warn('[notifications] Failed to check plan capacity:', capErr.message);
+    }
   }
 });
 

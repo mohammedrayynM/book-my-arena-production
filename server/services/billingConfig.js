@@ -289,16 +289,25 @@ async function getActiveFeeRule(countryCode, currencyCode, sectionType = 'ALL', 
     tax_inclusive: !!r.tax_inclusive,
     apply_to: r.apply_to || 'ALL',
     show_fee_at_checkout: r.show_fee_at_checkout !== 0,
-    is_active: r.is_active !== 0
+    is_active: r.is_active !== 0,
+    calculation_base: r.calculation_base || 'FULL'
   };
 }
 
 /**
  * Calculates customer fee and tax from a fee rule and pre-fee amount.
+ * @param {Object} rule - The active fee rule.
+ * @param {number} amountMajor - The full booking amount (major units, e.g. Rupees).
+ * @param {number} [onlineAmountMajor] - The online payable amount (major units). Used when rule.calculation_base === 'ONLINE'.
+ *   Falls back to amountMajor when not provided or when calculation_base is 'FULL'.
  * Returns amounts in major currency units (e.g. Rupees).
  */
-function calculateCustomerFee(rule, amountMajor) {
-  const base = Math.max(0, Number(amountMajor || 0));
+function calculateCustomerFee(rule, amountMajor, onlineAmountMajor) {
+  const fullAmount = Math.max(0, Number(amountMajor || 0));
+  // Determine the effective calculation base: when rule says 'ONLINE' and an online amount was explicitly supplied, use it.
+  const base = (rule && rule.calculation_base === 'ONLINE' && onlineAmountMajor !== undefined && onlineAmountMajor !== null)
+    ? Math.max(0, Number(onlineAmountMajor))
+    : fullAmount;
   if (!rule || rule.fee_type === 'NONE' || rule.is_active === false) {
     return {
       serviceFee: 0,
@@ -340,6 +349,7 @@ function calculateCustomerFee(rule, amountMajor) {
     tax_inclusive: rule.tax_inclusive,
     apply_to: rule.apply_to || 'ALL',
     show_fee_at_checkout: showFee,
+    calculation_base: rule.calculation_base || 'FULL',
     calculated_at: new Date().toISOString()
   };
 
@@ -382,12 +392,15 @@ async function publishFeeRule({ countryCode, currencyCode, input, adminId }) {
     : 'ALL';
   const showFeeAtCheckout = input.show_fee_at_checkout === false || input.show_fee_at_checkout === 0 ? 0 : 1;
   const isActive = input.is_active === false || input.is_active === 0 ? 0 : 1;
+  const calculationBase = ['FULL', 'ONLINE'].includes(String(input.calculation_base || '').toUpperCase())
+    ? String(input.calculation_base).toUpperCase()
+    : 'FULL';
 
   const [ins] = await pool.query(
     `INSERT INTO platform_fee_rules 
-      (country_code, currency_code, fee_type, fee_fixed_minor, fee_bps, tax_bps, tax_inclusive, refund_fee_policy, coupon_applies_before_fee, effective_from, created_by, note, apply_to, show_fee_at_checkout, is_active)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [country, currency, rule.fee_type, rule.fee_fixed_minor, rule.fee_bps, rule.tax_bps, rule.tax_inclusive, refundPolicy, input.coupon_applies_before_fee === false ? 0 : 1, effectiveFrom, adminId || null, String(input.note).trim().slice(0, 500), applyTo, showFeeAtCheckout, isActive]
+      (country_code, currency_code, fee_type, fee_fixed_minor, fee_bps, tax_bps, tax_inclusive, refund_fee_policy, coupon_applies_before_fee, effective_from, created_by, note, apply_to, show_fee_at_checkout, is_active, calculation_base)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [country, currency, rule.fee_type, rule.fee_fixed_minor, rule.fee_bps, rule.tax_bps, rule.tax_inclusive, refundPolicy, input.coupon_applies_before_fee === false ? 0 : 1, effectiveFrom, adminId || null, String(input.note).trim().slice(0, 500), applyTo, showFeeAtCheckout, isActive, calculationBase]
   );
   const [[row]] = await pool.query('SELECT * FROM platform_fee_rules WHERE id = ?', [ins.insertId]);
   return row;

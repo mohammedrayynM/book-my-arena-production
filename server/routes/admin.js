@@ -242,9 +242,10 @@ router.put('/turfs/:id/status', verifyToken, verifyAdmin, async (req, res) => {
 router.get('/pending-approvals', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const [turfs] = await pool.query(
-      `SELECT t.*, o.name as owner_name, o.email as owner_email, o.phone as owner_phone
+      `SELECT t.*, o.name as owner_name, o.email as owner_account_email, o.phone as owner_phone,
+              COALESCE(t.owner_email, o.email) as owner_email
        FROM turfs t
-       JOIN owners o ON t.owner_id = o.id
+       LEFT JOIN owners o ON t.owner_id = o.id
        WHERE t.approval_status IN ('PENDING_APPROVAL', 'ACTION_REQUIRED') AND (t.is_deleted IS NULL OR t.is_deleted = 0)
        ORDER BY t.created_at DESC`
     );
@@ -253,16 +254,30 @@ router.get('/pending-approvals', verifyToken, verifyAdmin, async (req, res) => {
       `SELECT c.*, t.name as turf_name, t.location as turf_location, t.currency_code, o.name as owner_name, o.email as owner_email
        FROM courts c
        JOIN turfs t ON c.turf_id = t.id
-       JOIN owners o ON t.owner_id = o.id
+       LEFT JOIN owners o ON t.owner_id = o.id
        WHERE c.approval_status IN ('PENDING_APPROVAL', 'ACTION_REQUIRED')
        ORDER BY c.created_at DESC`
     );
 
+    const formattedTurfs = turfs.map(t => ({
+      ...t,
+      images: typeof t.images === 'string' ? JSON.parse(t.images) : t.images || [],
+      amenities: typeof t.amenities === 'string' ? JSON.parse(t.amenities) : t.amenities || []
+    }));
+
+    const formattedCourts = courts.map(c => ({
+      ...c,
+      images: typeof c.images === 'string' ? JSON.parse(c.images) : c.images || [],
+      amenities: typeof c.amenities === 'string' ? JSON.parse(c.amenities) : c.amenities || []
+    }));
+
     res.json({
       success: true,
-      pending_turfs: turfs,
-      pending_courts: courts,
-      total_pending: turfs.length + courts.length
+      pending_turfs: formattedTurfs,
+      pending_courts: formattedCourts,
+      pendingVenues: formattedTurfs,
+      pendingCourts: formattedCourts,
+      total_pending: formattedTurfs.length + formattedCourts.length
     });
   } catch (err) {
     console.error('Error fetching pending approvals:', err);
@@ -272,38 +287,134 @@ router.get('/pending-approvals', verifyToken, verifyAdmin, async (req, res) => {
 
 // PUT /api/admin/turfs/:id/approval — Approve, reject, or request changes on a venue
 router.put('/turfs/:id/approval', verifyToken, verifyAdmin, async (req, res) => {
+  const conn = await pool.getConnection();
   try {
-    const { status, admin_feedback } = req.body;
+    const { status, approval_status, admin_feedback, billing_config, billing_model, commission_percentage, flat_fee, monthly_amount, subscription_period, subscription_policy, subscription_start_date } = req.body;
+    const finalStatus = status || approval_status;
     const validStatuses = ['APPROVED', 'REJECTED', 'ACTION_REQUIRED', 'PENDING_APPROVAL'];
-    if (!validStatuses.includes(status)) {
+    if (!validStatuses.includes(finalStatus)) {
+      conn.release();
       return res.status(400).json({ error: 'Invalid approval status' });
     }
 
-    const isApproved = status === 'APPROVED';
-    await pool.query(
-      `UPDATE turfs SET 
-         approval_status = ?, 
-         admin_feedback = ?, 
-         is_active = ?, 
-         status = ?,
-         approved_by = ?,
-         approved_at = ?
-       WHERE id = ?`,
-      [
-        status,
-        admin_feedback || null,
-        isApproved,
-        isApproved ? 'ACTIVE' : status,
-        isApproved ? req.user.id : null,
-        isApproved ? new Date() : null,
-        req.params.id
-      ]
-    );
+    // Check venue exists
+    const [existingRows] = await conn.query('SELECT * FROM turfs WHERE id = ?', [req.params.id]);
+    if (existingRows.length === 0) {
+      conn.release();
+      return res.status(404).json({ error: 'Venue not found' });
+    }
+    const turf = existingRows[0];
 
-    res.json({ success: true, message: `Venue status set to ${status}`, approval_status: status });
+    await conn.beginTransaction();
+
+    if (finalStatus === 'APPROVED') {
+      // Assemble billing configuration input from billing_config object or flat fields
+      const rawBilling = billing_config || {};
+      const model = String(rawBilling.billing_model || billing_model || 'PERCENTAGE').toUpperCase();
+
+      let billingInput = { billing_model: model };
+
+      if (model === 'PERCENTAGE') {
+        const commVal = rawBilling.commission_percent ?? rawBilling.commission_percentage ?? commission_percentage ?? 5;
+        const numVal = parseFloat(commVal);
+        if (isNaN(numVal) || numVal < 0 || numVal > 100) {
+          await conn.rollback();
+          conn.release();
+          return res.status(400).json({ error: 'Commission percentage must be a valid number between 0 and 100%' });
+        }
+        billingInput.commission_percent = numVal;
+      } else if (model === 'FLAT') {
+        const feeVal = rawBilling.flat_fee ?? flat_fee ?? 50;
+        const numVal = parseFloat(feeVal);
+        if (isNaN(numVal) || numVal < 0) {
+          await conn.rollback();
+          conn.release();
+          return res.status(400).json({ error: 'Fixed booking fee must be a valid non-negative number' });
+        }
+        billingInput.flat_fee = numVal;
+      } else if (model === 'SUBSCRIPTION') {
+        const subAmt = rawBilling.subscription_amount ?? rawBilling.monthly_amount ?? monthly_amount ?? 799;
+        const numVal = parseFloat(subAmt);
+        if (isNaN(numVal) || numVal <= 0) {
+          await conn.rollback();
+          conn.release();
+          return res.status(400).json({ error: 'Subscription amount must be a positive number' });
+        }
+        billingInput.subscription_amount = numVal;
+        billingInput.subscription_period = rawBilling.subscription_period || subscription_period || 'MONTHLY';
+        billingInput.subscription_policy = rawBilling.subscription_policy || subscription_policy || 'DEDUCT_FROM_PROCEEDS';
+        billingInput.subscription_start_date = rawBilling.subscription_start_date || subscription_start_date || new Date().toISOString().slice(0, 10);
+      } else {
+        await conn.rollback();
+        conn.release();
+        return res.status(400).json({ error: `Unknown billing model: ${model}. Must be FLAT, PERCENTAGE, or SUBSCRIPTION.` });
+      }
+
+      // Publish billing configuration transactionally
+      const reason = req.body.reason || admin_feedback || `Approved venue and configured ${model} billing`;
+      await billingConfig.publishConfig({
+        turfId: Number(req.params.id),
+        input: billingInput,
+        adminId: req.user.id,
+        reason,
+        connection: conn
+      });
+
+      // Update venue approval columns atomically
+      await conn.query(
+        `UPDATE turfs SET 
+           approval_status = 'APPROVED', 
+           admin_feedback = ?, 
+           is_active = 1, 
+           status = 'ACTIVE',
+           approved_by = ?,
+           approved_at = NOW(),
+           route_approved_by = ?,
+           route_approved_at = NOW()
+         WHERE id = ?`,
+        [admin_feedback || null, req.user.id, req.user.id, req.params.id]
+      );
+
+      await conn.commit();
+      conn.release();
+
+      return res.json({
+        success: true,
+        message: 'Venue approved and billing model assigned successfully',
+        approval_status: 'APPROVED',
+        billing_model: model
+      });
+    } else {
+      // REJECTED or ACTION_REQUIRED
+      await conn.query(
+        `UPDATE turfs SET 
+           approval_status = ?, 
+           admin_feedback = ?, 
+           is_active = 0, 
+           status = ?,
+           approved_by = NULL,
+           approved_at = NULL
+         WHERE id = ?`,
+        [finalStatus, admin_feedback || null, finalStatus, req.params.id]
+      );
+
+      await conn.commit();
+      conn.release();
+
+      return res.json({
+        success: true,
+        message: `Venue status set to ${finalStatus}`,
+        approval_status: finalStatus
+      });
+    }
   } catch (err) {
-    console.error('Error approving venue:', err);
-    res.status(500).json({ error: 'Failed to update venue approval status' });
+    try { await conn.rollback(); } catch (_) {}
+    conn.release();
+    console.error('Error in venue approval:', err);
+    if (err instanceof pricingService.PricingConfigError) {
+      return res.status(400).json({ error: err.message, errors: err.errors });
+    }
+    res.status(500).json({ error: err.message || 'Failed to update venue approval status' });
   }
 });
 

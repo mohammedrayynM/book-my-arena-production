@@ -588,12 +588,9 @@ router.post('/', verifyCustomer, async (req, res) => {
       currentBookable
     });
 
-    const { markupAmount, displayPrice } = computeOwnerMarkup(
-      totalBasePrice,
-      markupType,
-      markupValue,
-      targetSlots.length
-    );
+    // displayPrice must always equal totalBasePrice so pricing breakdown is 100% consistent across web and mobile
+    const markupAmount = 0;
+    const displayPrice = totalBasePrice;
 
     // Get service fee settings
     const [feeRows] = await pool.query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('service_fee', 'service_fee_type')");
@@ -731,26 +728,6 @@ router.post('/', verifyCustomer, async (req, res) => {
     // FINAL CALCULATION
     const priceAfterCoupon = totalBasePrice - discountAmount; // coupon applied FIRST
     
-    // Fetch active customer fee rule for venues
-    let serviceFee = 0;
-    let serviceFeeTax = 0;
-    let showFeeAtCheckout = true;
-    let feeRuleId = null;
-    let feeRuleSnapshot = null;
-    try {
-      // turf.currency_code, not venueCurrency: that const is declared further down, so using it here threw a
-      // ReferenceError on EVERY booking and the fee silently fell back to 0 (the price preview did charge it).
-      const activeFeeRule = await billingConfig.getActiveFeeRule(turf.country_code || 'IN', turf.currency_code || 'INR', 'VENUE');
-      const feeCalc = billingConfig.calculateCustomerFee(activeFeeRule, priceAfterCoupon);
-      serviceFee = feeCalc.serviceFee;
-      serviceFeeTax = feeCalc.serviceFeeTax;
-      showFeeAtCheckout = feeCalc.showFeeAtCheckout;
-      feeRuleId = feeCalc.feeRuleId;
-      feeRuleSnapshot = feeCalc.feeRuleSnapshot;
-    } catch (feeErr) {
-      console.error('[Bookings] Error calculating customer fee:', feeErr);
-    }
-
     // Find Players: the backend decides the split (services/playerSplit.js). Whatever contribution the client sends is ignored, so the
     // website, the app and the join link always show and charge the same share, worked out from the FINAL (post-coupon) amount.
     const isNeedPlayers = !!need_players;
@@ -762,9 +739,7 @@ router.post('/', verifyCustomer, async (req, res) => {
 
     let hostSplitShare = split ? split.hostShare : null;
     let totalPeople = split ? split.participants : null;
-    let finalAmount = split ? split.hostShare : priceAfterCoupon;
-
-    finalAmount = Math.max(0, finalAmount + serviceFee + serviceFeeTax);
+    const baseForHost = split ? split.hostShare : priceAfterCoupon;
 
     const advancePercent = parseInt(currentBookable.advance_percent || turf.advance_percent || 100, 10);
     // With Find Players on there is no advance option: the host pays their whole share online and each player pays theirs through the
@@ -773,8 +748,36 @@ router.post('/', verifyCustomer, async (req, res) => {
       ? 'full'
       : (String(payment_option || 'advance').toLowerCase() === 'full' ? 'full' : 'advance');
 
+    // Work out the online payable portion BEFORE fees, so the fee rule's calculation_base ('FULL' vs 'ONLINE') can pick the right base.
+    const preFeeFull = baseForHost;
+    const preFeeOnline = paymentType === 'advance'
+      ? Math.round((preFeeFull * (advancePercent / 100)) * 100) / 100
+      : preFeeFull;
+
+    // Fetch active customer fee rule for venues
+    let serviceFee = 0;
+    let serviceFeeTax = 0;
+    let showFeeAtCheckout = true;
+    let feeRuleId = null;
+    let feeRuleSnapshot = null;
+    try {
+      // turf.currency_code, not venueCurrency: that const is declared further down, so using it here threw a
+      // ReferenceError on EVERY booking and the fee silently fell back to 0 (the price preview did charge it).
+      const activeFeeRule = await billingConfig.getActiveFeeRule(turf.country_code || 'IN', turf.currency_code || 'INR', 'VENUE');
+      const feeCalc = billingConfig.calculateCustomerFee(activeFeeRule, preFeeFull, preFeeOnline);
+      serviceFee = feeCalc.serviceFee;
+      serviceFeeTax = feeCalc.serviceFeeTax;
+      showFeeAtCheckout = feeCalc.showFeeAtCheckout;
+      feeRuleId = feeCalc.feeRuleId;
+      feeRuleSnapshot = feeCalc.feeRuleSnapshot;
+    } catch (feeErr) {
+      console.error('[Bookings] Error calculating customer fee:', feeErr);
+    }
+
+    let finalAmount = Math.max(0, baseForHost + serviceFee + serviceFeeTax);
+
     const payableAmount = paymentType === 'advance'
-      ? Math.round((finalAmount * (advancePercent / 100)) * 100) / 100
+      ? Math.round((baseForHost * (advancePercent / 100) + serviceFee + serviceFeeTax) * 100) / 100
       : finalAmount;
     const pendingBalance = paymentType === 'advance'
       ? Math.round((finalAmount - payableAmount) * 100) / 100
@@ -1033,12 +1036,9 @@ router.post('/calculate-price', optionalAuth, async (req, res) => {
       currentBookable
     });
 
-    const { markupAmount, displayPrice } = computeOwnerMarkup(
-      totalBasePrice,
-      markupType,
-      markupValue,
-      targetSlots.length
-    );
+    // displayPrice must always equal totalBasePrice so pricing breakdown is 100% consistent across web and mobile
+    const markupAmount = 0;
+    const displayPrice = totalBasePrice;
 
     const [feeRows] = await pool.query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('service_fee', 'service_fee_type')");
     const settingsMap = {};
@@ -1162,24 +1162,6 @@ router.post('/calculate-price', optionalAuth, async (req, res) => {
     }
 
     const priceAfterCoupon = totalBasePrice - discountAmount; // coupon applied FIRST
-    
-    // Fetch active customer fee rule for venues
-    let serviceFee = 0;
-    let serviceFeeTax = 0;
-    let showFeeAtCheckout = true;
-    let feeRuleId = null;
-    let feeRuleSnapshot = null;
-    try {
-      const activeFeeRule = await billingConfig.getActiveFeeRule(turf.country_code || 'IN', turf.currency_code || 'INR', 'VENUE');
-      const feeCalc = billingConfig.calculateCustomerFee(activeFeeRule, priceAfterCoupon);
-      serviceFee = feeCalc.serviceFee;
-      serviceFeeTax = feeCalc.serviceFeeTax;
-      showFeeAtCheckout = feeCalc.showFeeAtCheckout;
-      feeRuleId = feeCalc.feeRuleId;
-      feeRuleSnapshot = feeCalc.feeRuleSnapshot;
-    } catch (feeErr) {
-      console.error('[Bookings] Error calculating customer fee in calculate-price:', feeErr);
-    }
 
     // Find Players: the backend decides the split (services/playerSplit.js). Whatever contribution the client sends is ignored, so the
     // website, the app and the join link always show and charge the same share, worked out from the FINAL (post-coupon) amount.
@@ -1192,9 +1174,7 @@ router.post('/calculate-price', optionalAuth, async (req, res) => {
 
     let hostSplitShare = split ? split.hostShare : null;
     let totalPeople = split ? split.participants : null;
-    let finalAmount = split ? split.hostShare : priceAfterCoupon;
-
-    finalAmount = Math.max(0, finalAmount + serviceFee);
+    const baseForHost = split ? split.hostShare : priceAfterCoupon;
 
     const advancePercent = parseInt(currentBookable.advance_percent || turf.advance_percent || 100, 10);
     // With Find Players on there is no advance option: the host pays their whole share online and each player pays theirs through the
@@ -1203,8 +1183,34 @@ router.post('/calculate-price', optionalAuth, async (req, res) => {
       ? 'full'
       : (String(payment_option || 'advance').toLowerCase() === 'full' ? 'full' : 'advance');
 
+    // Work out the online payable portion BEFORE fees, so the fee rule's calculation_base ('FULL' vs 'ONLINE') can pick the right base.
+    const preFeeFull = baseForHost;
+    const preFeeOnline = paymentType === 'advance'
+      ? Math.round((preFeeFull * (advancePercent / 100)) * 100) / 100
+      : preFeeFull;
+
+    // Fetch active customer fee rule for venues
+    let serviceFee = 0;
+    let serviceFeeTax = 0;
+    let showFeeAtCheckout = true;
+    let feeRuleId = null;
+    let feeRuleSnapshot = null;
+    try {
+      const activeFeeRule = await billingConfig.getActiveFeeRule(turf.country_code || 'IN', turf.currency_code || 'INR', 'VENUE');
+      const feeCalc = billingConfig.calculateCustomerFee(activeFeeRule, preFeeFull, preFeeOnline);
+      serviceFee = feeCalc.serviceFee;
+      serviceFeeTax = feeCalc.serviceFeeTax;
+      showFeeAtCheckout = feeCalc.showFeeAtCheckout;
+      feeRuleId = feeCalc.feeRuleId;
+      feeRuleSnapshot = feeCalc.feeRuleSnapshot;
+    } catch (feeErr) {
+      console.error('[Bookings] Error calculating customer fee in calculate-price:', feeErr);
+    }
+
+    let finalAmount = Math.max(0, baseForHost + serviceFee + serviceFeeTax);
+
     const advanceAmount = paymentType === 'advance'
-      ? Math.round((finalAmount * (advancePercent / 100)) * 100) / 100
+      ? Math.round((baseForHost * (advancePercent / 100) + serviceFee + serviceFeeTax) * 100) / 100
       : finalAmount;
     const pendingBalance = paymentType === 'advance'
       ? Math.round((finalAmount - advanceAmount) * 100) / 100

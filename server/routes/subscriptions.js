@@ -444,5 +444,58 @@ router.get('/:id', verifyToken, async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: 'Failed to load the subscription' }); }
 });
 
+// GET /api/subscriptions/:id/receipt — structured receipt for a member subscription
+router.get('/:id/receipt', verifyToken, async (req, res) => {
+  try {
+    if (!isId(req.params.id)) return res.status(404).json({ error: 'Subscription not found' });
+    const [[s]] = await pool.query(`${SUB_SELECT.replace('t.name AS turf_name,', 't.name AS turf_name, t.location AS turf_location, t.address AS turf_address,')} WHERE s.id = ?`, [req.params.id]);
+    if (!s) return res.status(404).json({ error: 'Subscription not found' });
+    const role = req.user.role || 'user';
+    const allowed = (role === 'user' && Number(s.user_id) === Number(req.user.id)) || (role === 'owner' && Number(s.venue_owner_id) === Number(req.user.id)) || role === 'admin';
+    if (!allowed) return res.status(403).json({ error: 'Forbidden' });
+
+    const cur = s.currency_code || 'INR';
+    const amountPaid = fromMinor(Number(s.amount_paid_minor || 0), cur);
+    const receipt = {
+      receipt_number: `SUB-REC-${s.id}-${String(s.plan_id).slice(-4)}`,
+      subscription_id: s.id,
+      issued_at: s.activated_at || s.created_at,
+      member: {
+        name: s.member_name || s.user_name || 'Member',
+        email: s.member_email || s.user_email || null,
+        phone: s.member_phone || null,
+        user_id: s.user_id
+      },
+      venue: {
+        name: s.turf_name,
+        location: s.turf_location,
+        address: s.turf_address || s.turf_location,
+        sport_type: s.sport_type,
+        court_name: s.court_name || 'Main Court'
+      },
+      plan: {
+        name: s.plan_name,
+        slot: `${hhmm(s.start_time)} - ${hhmm(s.end_time)}`,
+        days: daysLabel(s.weekdays),
+        duration_months: s.period_months || s.months_total || 1
+      },
+      validity: {
+        start_date: s.start_date,
+        expiry_date: s.expiry_date,
+        current_period_start: s.current_period_start,
+        current_period_end: s.current_period_end
+      },
+      payment: {
+        status: s.payment_status,
+        method: s.payment_type || s.source,
+        payment_id: s.razorpay_payment_id || null,
+        amount_paid: amountPaid,
+        currency: cur
+      }
+    };
+    res.json({ success: true, receipt });
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Failed to generate receipt' }); }
+});
+
 module.exports = router;
 module.exports.CANCEL_MESSAGE = CANCEL_MESSAGE;
