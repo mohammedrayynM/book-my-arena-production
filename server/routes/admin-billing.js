@@ -865,4 +865,51 @@ router.post('/transfers/:id/retry', throttle(10, 60000), async (req, res) => {
   } catch (e) { handleError(res, e, 'Could not retry the transfer'); }
 });
 
+// ------------------------------------------------------------------------------------------------------------------
+// Booking Payment Reconciliation & Audit Trails
+// ------------------------------------------------------------------------------------------------------------------
+router.get('/reconcile-logs', async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT * FROM payment_reconciliation_logs ORDER BY id DESC LIMIT 100`
+    );
+    res.json({ success: true, logs: rows });
+  } catch (e) {
+    handleError(res, e, 'Could not fetch reconciliation logs');
+  }
+});
+
+router.get('/unresolved-payments', async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT b.id, b.customer_name, b.customer_phone, b.customer_email, b.booking_date, b.time_slot,
+              b.amount, b.advance_amount, b.payment_status, b.status, b.razorpay_order_id, b.payment_id,
+              b.created_at, t.name as turf_name
+       FROM bookings b
+       JOIN turfs t ON b.turf_id = t.id
+       WHERE (b.status = 'reconciliation_required' OR b.payment_status = 'reconciliation_required'
+              OR (b.status = 'pending' AND b.payment_status = 'pending' AND b.created_at < NOW() - INTERVAL 5 MINUTE))
+       ORDER BY b.id DESC LIMIT 50`
+    );
+    res.json({ success: true, unresolved: rows });
+  } catch (e) {
+    handleError(res, e, 'Could not fetch unresolved payments');
+  }
+});
+
+router.post('/reconcile-order', throttle(10, 60000), async (req, res) => {
+  try {
+    const { order_id } = req.body;
+    if (!order_id) return bad(res, 400, 'order_id is required');
+    const paymentConfirmationService = require('../services/paymentConfirmationService');
+    const result = await paymentConfirmationService.reconcileOrderByOrderId({
+      orderId: order_id,
+      source: 'admin_manual'
+    });
+    res.json({ success: true, result });
+  } catch (e) {
+    handleError(res, e, 'Could not reconcile order');
+  }
+});
+
 module.exports = router;

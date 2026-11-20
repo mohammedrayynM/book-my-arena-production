@@ -20,6 +20,8 @@ const availabilityService = require('../services/availabilityService');
 const venueBillingRestrictions = require('../services/venueBillingRestrictions');
 const activityBooking = require('../services/activityBooking');
 const billingConfig = require('../services/billingConfig');
+const paymentConfirmationService = require('../services/paymentConfirmationService');
+const receiptService = require('../services/receiptService');
 require('dotenv').config();
 
 const razorpay = new Razorpay({
@@ -1664,119 +1666,54 @@ router.post('/verify', verifyCustomer, async (req, res) => {
     const signatureIsValid = suppliedBuffer.length === expectedBuffer.length
       && crypto.timingSafeEqual(expectedBuffer, suppliedBuffer);
 
-    if (signatureIsValid) {
-      // Handle array of strings or single string
-      const ids = String(booking_id).split(',').map(id => parseInt(id.trim())).filter(id => !isNaN(id));
-      if (ids.length === 0) {
-        return res.status(400).json({ success: false, error: 'Valid booking IDs are required' });
-      }
-
-      let verifiedPayment = { ok: true };
-      if (ids.length > 0) {
-        // Retrieve booking details to check conflict
-        const placeholders = ids.map(() => '?').join(',');
-        const [bookingsToCheck] = await pool.query(
-          `SELECT id, user_id, turf_id, court_id, booking_date, time_slot, razorpay_order_id, payment_id, payment_status, status, advance_amount, amount, currency_code FROM bookings WHERE id IN (${placeholders})`,
-          [...ids]
-        );
-
-        // The signature only proves "this payment belongs to this order". The booking ids come from the client, so make
-        // sure every one of them is actually on that order — otherwise a cheap paid order could confirm someone else's booking.
-        if (bookingsToCheck.length !== ids.length || bookingsToCheck.some((b) =>
-          Number(b.user_id) !== Number(req.user.id) || !razorpay_order_id || b.razorpay_order_id !== razorpay_order_id
-        )) {
-          console.error(`[Payments] /verify: bookings ${ids.join(',')} are not all on order ${razorpay_order_id}; refusing`);
-          return res.status(400).json({ success: false, error: 'Payment does not belong to these bookings' });
-        }
-        // Already confirmed with this very payment (customer double-tapped, or the webhook got there first): just report success.
-        if (bookingsToCheck.every((b) => b.payment_status === 'success' && b.payment_id === razorpay_payment_id)) {
-          try { if (razorpay_payment_id) await routeSplit.processSplitTransfer({ paymentId: razorpay_payment_id, orderId: razorpay_order_id, bookingIds: ids }); } catch (e) { console.error('[RouteSplit] /verify (already confirmed):', e.message); }
-          return res.json({ success: true, message: 'Payment verified successfully', already_confirmed: true });
-        }
-
-        verifiedPayment = await checkPaymentWithRazorpay({ paymentId: razorpay_payment_id, orderId: razorpay_order_id, bookingRows: bookingsToCheck });
-        if (!verifiedPayment.ok) {
-          return res.status(verifiedPayment.status).json({ success: false, pending: !!verifiedPayment.pending, error: verifiedPayment.error });
-        }
-
-        const alreadyPaidWithAnotherPayment = bookingsToCheck.some((b) =>
-          b.payment_status === 'success' && b.payment_id !== razorpay_payment_id
-        );
-        if (alreadyPaidWithAnotherPayment) {
-          const duplicateRefund = await refundConflictedPayment({ bookingIds: ids, paymentId: razorpay_payment_id });
-          return res.status(409).json({
-            success: false,
-            code: 'DUPLICATE_PAYMENT_REFUNDED',
-            refund_initiated: !!(duplicateRefund.refunds && duplicateRefund.refunds.length),
-            error: 'This booking already has a verified payment. The additional payment is being refunded.'
-          });
-        }
-
-        const venueIds = new Set(bookingsToCheck.map((booking) => Number(booking.turf_id)));
-        if (venueIds.size !== 1) {
-          return res.status(400).json({ success: false, error: 'Bookings must belong to one venue' });
-        }
-        const lockedTurfId = bookingsToCheck[0].turf_id;
-        let confirmFollowUp = null;
-        let lostSlot = false;
-        const slotLockAcquired = await acquireSlotLock(lockedTurfId);
-        if (!slotLockAcquired) {
-          return res.status(503).json({ success: false, pending: true, error: 'Payment is verified; your booking is still being finalized. Please check again shortly.' });
-        }
-        try {
-        // Serialize with both new slot creation and subscription activation before checking and confirming.
-        const vlock = await subscriptionReservations.lockVenue(lockedTurfId);
-        try {
-        const slotConflict = await paidSlotConflict(bookingsToCheck, ids);
-
-        if (slotConflict) {
-          // Update these bookings to failed/cancelled since the slot is no longer available (inside the venue lock's
-          // transaction; the refund and notification run after the locks are released, below)
-          await vlock.conn.query(
-            `UPDATE bookings SET payment_status = 'failed', status = 'cancelled' WHERE id IN (${placeholders})`,
-            [...ids]
-          );
-          lostSlot = true;
-        } else {
-          confirmFollowUp = await confirmBookings(ids, razorpay_payment_id, { conn: vlock.conn, deferFollowUp: true });
-        }
-        } finally { if (vlock) await vlock.release(); }
-        } finally { await releaseSlotLock(lockedTurfId); }
-
-        if (lostSlot) {
-          fireNotification('booking.failed', { bookingIds: ids, reason: 'slot_unavailable', paymentId: razorpay_payment_id });
-          // the customer paid for a slot that is gone: refund in full (idempotent; never blocks this response)
-          const conflictRefund = await refundConflictedPayment({ bookingIds: ids, paymentId: razorpay_payment_id });
-          return res.status(409).json({ success: false, code: 'SLOT_CONFLICT_REFUNDED', refund_initiated: !!(conflictRefund.refunds && conflictRefund.refunds.length), error: 'Sorry, one or more slots were taken just before your payment completed. Your payment is being refunded in full to your original payment method.' });
-        }
-        if (confirmFollowUp) await confirmFollowUp();
-
-        try {
-          const emailResults = await sendBookingConfirmationEmails(ids);
-          if (emailResults?.owner && emailResults.owner.success === false) {
-            console.warn(`⚠️ Owner booking email was not delivered to ${emailResults.ownerEmail || 'unknown'}: ${emailResults.owner.error || emailResults.owner.message}`);
-          }
-        } catch (emailErr) {
-          console.error('Email Notification Error:', emailErr.message);
-        }
-
-        // --- Razorpay Route split transfer (new, per-turf, percentage-based; feature-gated by turfs.route_enabled) ---
-        // Never allowed to affect booking confirmation either way: it always runs after confirmBookings() above,
-        // wrapped so a Route failure is only ever logged, exactly like the legacy trigger it replaces.
-        try {
-          if (razorpay_payment_id) {
-            const split = await routeSplit.processSplitTransfer({ paymentId: razorpay_payment_id, orderId: razorpay_order_id, bookingIds: ids, capturedMinor: verifiedPayment.capturedMinor, currency: verifiedPayment.currency });
-            if (split && split.error) console.error(`[RouteSplit] /verify payment ${razorpay_payment_id}: ${split.error}`);
-          }
-        } catch (routeErr) {
-          console.error('[RouteSplit] Route split transfer failed during /verify. Manual reconciliation may be required:', routeErr);
-        }
-      }
-
-      res.json({ success: true, message: 'Payment verified successfully' });
-    } else {
-      res.status(400).json({ success: false, error: 'Payment verification failed' });
+    if (!signatureIsValid) {
+      return res.status(400).json({ success: false, error: 'Payment verification failed: invalid signature' });
     }
+
+    const ids = String(booking_id).split(',').map(id => parseInt(id.trim())).filter(id => !isNaN(id));
+    if (ids.length === 0) {
+      return res.status(400).json({ success: false, error: 'Valid booking IDs are required' });
+    }
+
+    const result = await paymentConfirmationService.confirmPaymentAndAllocateSlot({
+      orderId: razorpay_order_id,
+      paymentId: razorpay_payment_id,
+      bookingIds: ids,
+      source: 'frontend_verify',
+      expectedUserId: req.user.id
+    });
+
+    if (result.success) {
+      return res.json({
+        success: true,
+        message: 'Payment verified successfully',
+        already_confirmed: !!result.alreadyConfirmed,
+        booking_id: result.bookingIds?.join(','),
+        payment_id: result.paymentId
+      });
+    }
+
+    if (result.code === 'SLOT_CONFLICT_REFUNDED' || result.code === 'DUPLICATE_PAYMENT_REFUNDED') {
+      return res.status(409).json({
+        success: false,
+        code: result.code,
+        refund_initiated: result.refundInitiated,
+        error: result.error
+      });
+    }
+
+    if (result.pending) {
+      return res.status(202).json({
+        success: false,
+        pending: true,
+        error: result.error
+      });
+    }
+
+    return res.status(result.status || 400).json({
+      success: false,
+      error: result.error || 'Payment verification failed'
+    });
   } catch (err) {
     console.error('Error verifying payment:', err);
     res.status(500).json({ error: 'Payment verification failed' });
@@ -1875,16 +1812,16 @@ router.post('/cancel-pending', verifyCustomer, async (req, res) => {
 
     if (hasCapturedPayment && capturedPaymentId) {
       console.log(`[Payments] cancel-pending detected captured payment ${capturedPaymentId} for order ${orderId}. Confirming booking!`);
-      await confirmBookings(ids, capturedPaymentId);
-      try {
-        await sendBookingConfirmationEmails(ids);
-      } catch (emailErr) {
-        console.warn('[Payments] Email send on reconciled confirmation failed:', emailErr.message);
-      }
+      const conf = await paymentConfirmationService.confirmPaymentAndAllocateSlot({
+        orderId,
+        paymentId: capturedPaymentId,
+        bookingIds: ids,
+        source: 'cancel_pending'
+      });
       return res.json({
         success: true,
-        confirmed: true,
-        message: 'Payment was verified. Your booking is confirmed.'
+        confirmed: !!conf.success,
+        message: conf.success ? 'Payment was verified. Your booking is confirmed.' : (conf.error || 'Payment requires reconciliation.')
       });
     }
 
@@ -2084,109 +2021,20 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
         }
       }
 
-      const hasRazorpayOrderId = await hasColumn('bookings', 'razorpay_order_id');
-      let rows = [];
+      // Sports / Turf Venue booking payment confirmation (unified authoritative service)
+      const result = await paymentConfirmationService.confirmPaymentAndAllocateSlot({
+        orderId: order_id,
+        paymentId: payment_id,
+        source: 'webhook',
+        razorpayPaymentObj: event.payload.payment.entity
+      });
 
-      if (hasRazorpayOrderId && order_id) {
-        const [orderRows] = await pool.query(
-          `SELECT id, turf_id, court_id, booking_date, time_slot, customer_email, customer_name, currency_code
-           FROM bookings
-           WHERE razorpay_order_id = ?`,
-          [order_id]
-        );
-        rows = orderRows;
+      if (result.success) {
+        console.log(`✅ Webhook confirmed bookings ${result.bookingIds?.join(', ')} for payment ${payment_id}`);
+      } else {
+        console.warn(`⚠️ Webhook confirmation outcome for payment ${payment_id}:`, result.error || result.code);
       }
-
-      if (rows.length === 0) {
-        // Match ONLY on the payment id. (The old fallback also matched "any pending booking with the same amount",
-        // which let one customer's payment confirm a stranger's booking.)
-        const [fallbackRows] = await pool.query(
-          `SELECT id, turf_id, court_id, booking_date, time_slot, customer_email, customer_name, currency_code
-           FROM bookings
-           WHERE payment_id = ?`,
-          [payment_id]
-        );
-        rows = fallbackRows;
-      }
-
-      // Never confirm on an underpayment: the captured amount must cover what these bookings require.
-      if (rows.length > 0) {
-        const [amountRows] = await pool.query(
-          `SELECT advance_amount, amount, currency_code FROM bookings WHERE id IN (${rows.map(() => '?').join(',')})`, rows.map((r) => r.id)
-        );
-        const expectedCurrency = amountRows[0]?.currency_code || 'INR';
-        const expectedMinor = amountRows.reduce((sum, r) => sum + toMinor(Number(r.advance_amount != null ? r.advance_amount : r.amount || 0), expectedCurrency), 0);
-        if (amountRows.some((r) => (r.currency_code || 'INR') !== expectedCurrency) || captured_currency !== expectedCurrency
-          || !Number.isSafeInteger(Number(captured_amount)) || (expectedMinor > 0 && Number(captured_amount) < expectedMinor)) {
-          console.error(`[Webhook] payment ${payment_id} captured ${captured_amount} but bookings ${rows.map((r) => r.id).join(',')} need ${expectedMinor}; not confirming`);
-          return res.json({ status: 'ok' });
-        }
-      }
-
-      if (rows.length > 0) {
-        const ids = rows.map(row => row.id);
-        const placeholders = ids.map(() => '?').join(',');
-        let slotConflict = new Set(rows.map((booking) => Number(booking.turf_id))).size !== 1;
-
-        // A repeated delivery of the same event (Razorpay retries) for bookings this payment already confirmed:
-        // nothing to confirm or e-mail again — only make sure the (idempotent) split exists, then acknowledge.
-        const [[alreadyDone]] = await pool.query(
-          `SELECT COUNT(*) AS c FROM bookings WHERE id IN (${placeholders}) AND payment_status = 'success' AND payment_id = ?`, [...ids, payment_id]
-        );
-        if (Number(alreadyDone.c) === ids.length) {
-          try { if (payment_id) await routeSplit.processSplitTransfer({ paymentId: payment_id, orderId: order_id, bookingIds: ids, capturedMinor: Number(captured_amount), currency: captured_currency }); }
-          catch (routeErr) { console.error('[RouteSplit] duplicate webhook:', routeErr.message); }
-          return res.json({ status: 'ok' });
-        }
-
-        const lockedTurfId = rows[0].turf_id;
-        const slotLockAcquired = !slotConflict && await acquireSlotLock(lockedTurfId);
-        if (!slotConflict && !slotLockAcquired) throw new Error(`Could not acquire slot lock for captured payment ${payment_id}; webhook will retry`);
-        let webhookFollowUp = null;
-        try {
-        if (!slotConflict) slotConflict = await paidSlotConflict(rows, ids);
-
-        if (!slotConflict) {
-          const vlock = await subscriptionReservations.lockVenue(rows[0].turf_id);
-          try {
-            // re-check under the venue lock: a subscription may have been activated while we were looking
-            for (const booking of rows) {
-              if (await subscriptionReservations.slotReserved({ turfId: booking.turf_id, courtId: booking.court_id, date: booking.booking_date, slotLabel: booking.time_slot })) { slotConflict = true; break; }
-            }
-            if (!slotConflict) webhookFollowUp = await confirmBookings(ids, payment_id, { conn: vlock.conn, deferFollowUp: true });
-          } finally { await vlock.release(); }
-        }
-        } finally {
-          if (slotLockAcquired) await releaseSlotLock(lockedTurfId);
-        }
-        if (webhookFollowUp) await webhookFollowUp();
-
-        if (!slotConflict) {
-          try {
-            await sendBookingConfirmationEmails(ids);
-          } catch (emailErr) {
-            console.error('Webhook Email Notification Error:', emailErr.message);
-          }
-          console.log(`✅ Webhook confirmed bookings ${ids.join(', ')}`);
-
-          // --- Razorpay Route split transfer (new, per-turf, percentage-based; feature-gated by turfs.route_enabled) ---
-          try {
-            if (payment_id) {
-              const split = await routeSplit.processSplitTransfer({ paymentId: payment_id, orderId: order_id, bookingIds: ids, capturedMinor: Number(captured_amount), currency: captured_currency });
-              if (split && split.error) console.error(`[RouteSplit] webhook payment ${payment_id}: ${split.error}`);
-            }
-          } catch (routeErr) {
-            console.error('[RouteSplit] Route split transfer failed during webhook:', routeErr);
-          }
-        } else {
-          await pool.query(
-            `UPDATE bookings SET payment_status = 'failed', status = 'cancelled' WHERE id IN (${placeholders})`,
-            [...ids]
-          );
-          console.log(`❌ Webhook cancelled conflict bookings ${ids.join(', ')}`);
-          if (payment_id) await refundConflictedPayment({ bookingIds: ids, paymentId: payment_id });
-        }
-      }
+      return res.json({ status: 'ok', confirmed: !!result.success });
     } else if (event.event === 'payment.failed') {
       // One failed ATTEMPT (Razorpay lets the customer retry the same order): tell them, but leave the booking/subscription as it is
       const failedPayment = event.payload.payment.entity;
@@ -2240,58 +2088,18 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
   }
 });
 
-// POST /api/bookings/cleanup-pending - Clean up expired pending bookings
+// POST /api/bookings/cleanup-pending - Run reconciliation & clean up expired pending bookings
 router.post('/cleanup-pending', async (req, res) => {
   try {
-    const [expiredCandidates] = await pool.query(
-      "SELECT id, razorpay_order_id FROM bookings WHERE status = 'pending' AND payment_status = 'pending' AND created_at < NOW() - INTERVAL 5 MINUTE"
-    );
-    const byOrder = new Map();
-    const noOrderIds = [];
-    for (const booking of expiredCandidates) {
-      if (!booking.razorpay_order_id) noOrderIds.push(booking.id);
-      else {
-        const orderIds = byOrder.get(booking.razorpay_order_id) || [];
-        orderIds.push(booking.id);
-        byOrder.set(booking.razorpay_order_id, orderIds);
-      }
-    }
-
-    const safeToExpire = [...noOrderIds];
-    let deferred = 0;
-    for (const [orderId, bookingIds] of byOrder) {
-      try {
-        const payments = await routeProvider.fetchOrderPayments(orderId);
-        const hasUnresolvedPayment = payments.some((payment) => payment.status !== 'failed');
-        if (hasUnresolvedPayment) deferred += bookingIds.length;
-        else safeToExpire.push(...bookingIds);
-      } catch (gatewayError) {
-        deferred += bookingIds.length;
-        console.warn(`[Payments] Could not reconcile stale order ${orderId}; keeping its booking hold: ${gatewayError.message}`);
-      }
-    }
-
-    let expired = 0;
-    if (safeToExpire.length) {
-      const placeholders = safeToExpire.map(() => '?').join(',');
-      const [result] = await pool.query(
-        `UPDATE bookings SET status = 'cancelled', payment_status = 'expired'
-         WHERE id IN (${placeholders}) AND status = 'pending' AND payment_status = 'pending'
-           AND created_at < NOW() - INTERVAL 5 MINUTE`,
-        safeToExpire
-      );
-      expired = result.affectedRows;
-    }
-
+    const { runReconciliationCycle } = require('../services/reconciliationWorker');
+    await runReconciliationCycle();
     res.json({
       success: true,
-      expired,
-      deferred,
-      message: `Expired ${expired} unpaid bookings; retained ${deferred} with unresolved payment status`
+      message: 'Reconciliation cycle completed successfully'
     });
   } catch (err) {
-    console.error('Error cleaning up pending bookings:', err);
-    res.status(500).json({ error: 'Cleanup failed' });
+    console.error('Error running reconciliation cycle:', err);
+    res.status(500).json({ error: 'Reconciliation failed: ' + err.message });
   }
 });
 
@@ -2330,9 +2138,18 @@ router.post('/release', verifyCustomer, async (req, res) => {
         const captured = payments.find(p => p.status === 'captured');
         if (captured) {
           console.log(`[Bookings/release] Found captured payment ${captured.id} for order ${orderId}. Confirming instead of releasing.`);
-          await confirmBookings(ids, captured.id);
-          try { await sendBookingConfirmationEmails(ids); } catch (e) { /* non-critical */ }
-          return res.json({ success: true, confirmed: true, message: 'Payment was verified. Your booking is confirmed.' });
+          const conf = await paymentConfirmationService.confirmPaymentAndAllocateSlot({
+            orderId,
+            paymentId: captured.id,
+            bookingIds: ids,
+            source: 'release_check',
+            razorpayPaymentObj: captured
+          });
+          return res.json({
+            success: true,
+            confirmed: !!conf.success,
+            message: conf.success ? 'Payment was verified. Your booking is confirmed.' : (conf.error || 'Payment requires reconciliation.')
+          });
         }
       } catch (e) {
         console.warn('[Bookings/release] Razorpay query failed:', e.message);
@@ -2347,6 +2164,63 @@ router.post('/release', verifyCustomer, async (req, res) => {
   } catch (err) {
     console.error('Error releasing slot:', err);
     res.status(500).json({ error: 'Failed to release slot: ' + err.message });
+  }
+});
+
+// GET /api/bookings/:id/receipt — Retrieve durable receipt
+router.get('/:id/receipt', optionalAuth, async (req, res) => {
+  try {
+    const rawId = req.params.id;
+    const bookingId = parseInt(rawId, 10);
+    if (!bookingId || isNaN(bookingId)) {
+      return res.status(404).json({ error: 'Receipt not found' });
+    }
+
+    const [receiptRows] = await pool.query(
+      'SELECT * FROM booking_receipts WHERE booking_id = ? ORDER BY id DESC LIMIT 1',
+      [bookingId]
+    );
+
+    if (receiptRows.length > 0) {
+      const receipt = receiptRows[0];
+      let details = null;
+      try { details = JSON.parse(receipt.receipt_json); } catch (_) {}
+      return res.json({ success: true, receipt, details });
+    }
+
+    const [bRows] = await pool.query(
+      `SELECT b.*, t.name as turf_name, c.name as court_name 
+       FROM bookings b 
+       JOIN turfs t ON b.turf_id = t.id 
+       LEFT JOIN courts c ON b.court_id = c.id 
+       WHERE b.id = ?`,
+      [bookingId]
+    );
+    if (bRows.length === 0) return res.status(404).json({ error: 'Booking not found' });
+    const b = bRows[0];
+
+    return res.json({
+      success: true,
+      receipt: {
+        booking_id: b.id,
+        receipt_number: `RCP-${b.id}-${b.razorpay_order_id ? b.razorpay_order_id.replace(/^order_/, '') : b.id}`,
+        turf_name: b.turf_name,
+        court_name: b.court_name,
+        booking_date: b.booking_date,
+        time_slot: b.time_slot,
+        customer_name: b.customer_name,
+        customer_phone: b.customer_phone,
+        customer_email: b.customer_email,
+        payment_type: b.payment_type || 'full',
+        total_amount: b.amount,
+        amount_paid: b.advance_amount != null ? b.advance_amount : b.amount,
+        pending_balance: b.pending_balance || 0,
+        razorpay_payment_id: b.payment_id,
+        created_at: b.created_at
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not load receipt: ' + err.message });
   }
 });
 

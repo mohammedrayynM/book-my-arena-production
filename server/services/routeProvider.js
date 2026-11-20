@@ -27,7 +27,7 @@ async function fetchPayment(paymentId) {
 
 /** Payments attempted against an order, including failed, authorized, and captured attempts. */
 async function fetchOrderPayments(orderId) {
-  const res = await client().orders.fetchPayments(orderId, { count: 100 });
+  const res = await client().orders.fetchPayments(orderId);
   if (!res || !Array.isArray(res.items)) throw new Error('Razorpay returned an invalid order payment list');
   return res.items;
 }

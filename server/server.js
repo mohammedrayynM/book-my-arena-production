@@ -315,6 +315,7 @@ ensureActivitiesSchema().catch(err => console.error('Activities migration error:
   // sport categories, venue<->sport links, discovery indexes (needs turfs/bookings/advertisements to exist)
   .then(() => require('./migrate_discovery')())
   .then(() => require('./migrate_slots_policy')())
+  .then(() => require('./migrate_payment_reliability')())
   .catch(err => console.error('Global migration error:', err.message));
 
 // Middleware
@@ -462,48 +463,9 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Automated reconciliation & cleanup of unpaid pending bookings (runs every 2 minutes)
-// 1. Checks Razorpay for captured payments: if money was received, AUTOMATICALLY CONFIRMS the booking!
-// 2. If checkout was abandoned or payment failed, safely expires the hold so the slot is freed.
-const routeProvider = require('./services/routeProvider');
-
-setInterval(async () => {
-  try {
-    const [pending] = await pool.query(
-      `SELECT id, razorpay_order_id, turf_id, time_slot, booking_date 
-       FROM bookings 
-       WHERE status = 'pending' AND payment_status = 'pending' 
-         AND created_at < NOW() - INTERVAL 5 MINUTE`
-    );
-    if (!pending || pending.length === 0) return;
-
-    for (const b of pending) {
-      if (b.razorpay_order_id) {
-        try {
-          const payments = await routeProvider.fetchOrderPayments(b.razorpay_order_id);
-          const captured = payments.find(p => p.status === 'captured');
-          if (captured) {
-            console.log(`[AutoReconcile] Captured payment ${captured.id} found for order ${b.razorpay_order_id}. Auto-confirming booking ${b.id}!`);
-            await pool.query(
-              `UPDATE bookings SET payment_id = ?, payment_status = 'success', status = 'confirmed', cancel_reason = NULL, cancelled_at = NULL WHERE id = ?`,
-              [captured.id, b.id]
-            );
-            continue;
-          }
-        } catch (gatewayErr) {
-          console.warn(`[AutoReconcile] Could not check order ${b.razorpay_order_id}:`, gatewayErr.message);
-          continue;
-        }
-      }
-      await pool.query(
-        `UPDATE bookings SET status = 'cancelled', payment_status = 'expired', cancel_reason = 'timeout_expired', cancelled_at = NOW() WHERE id = ? AND status = 'pending'`,
-        [b.id]
-      );
-    }
-  } catch (err) {
-    console.error('[AutoCleanup] Failed to reconcile pending bookings:', err.message);
-  }
-}, 2 * 60 * 1000);
+// Start the distributed background payment reconciliation worker (every 2m, lease-backed)
+const { startReconciliationWorker } = require('./services/reconciliationWorker');
+startReconciliationWorker();
 
 app.listen(PORT, () => {
   console.log(`\n🏟️  Book Arena API Server`);
