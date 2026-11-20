@@ -750,9 +750,9 @@ router.post('/', verifyCustomer, async (req, res) => {
 
     // Work out the online payable portion BEFORE fees, so the fee rule's calculation_base ('FULL' vs 'ONLINE') can pick the right base.
     const preFeeFull = baseForHost;
-    const preFeeOnline = paymentType === 'advance'
-      ? Math.round((preFeeFull * (advancePercent / 100)) * 100) / 100
-      : preFeeFull;
+    const preFeeAdvance = Math.round((preFeeFull * (advancePercent / 100)) * 100) / 100;
+    const preFeePending = Math.round((preFeeFull - preFeeAdvance) * 100) / 100;
+    const preFeeOnline = paymentType === 'advance' ? preFeeAdvance : preFeeFull;
 
     // Fetch active customer fee rule for venues
     let serviceFee = 0;
@@ -774,14 +774,13 @@ router.post('/', verifyCustomer, async (req, res) => {
       console.error('[Bookings] Error calculating customer fee:', feeErr);
     }
 
-    let finalAmount = Math.max(0, baseForHost + serviceFee + serviceFeeTax);
-
     const payableAmount = paymentType === 'advance'
-      ? Math.round((baseForHost * (advancePercent / 100) + serviceFee + serviceFeeTax) * 100) / 100
-      : finalAmount;
+      ? Math.round((preFeeAdvance + serviceFee + serviceFeeTax) * 100) / 100
+      : Math.round((baseForHost + serviceFee + serviceFeeTax) * 100) / 100;
     const pendingBalance = paymentType === 'advance'
-      ? Math.round((finalAmount - payableAmount) * 100) / 100
+      ? preFeePending
       : 0;
+    const finalAmount = Math.round((payableAmount + pendingBalance) * 100) / 100;
 
     const payableNow = payableAmount;
     const finalFullAmount = finalAmount;
@@ -1185,9 +1184,9 @@ router.post('/calculate-price', optionalAuth, async (req, res) => {
 
     // Work out the online payable portion BEFORE fees, so the fee rule's calculation_base ('FULL' vs 'ONLINE') can pick the right base.
     const preFeeFull = baseForHost;
-    const preFeeOnline = paymentType === 'advance'
-      ? Math.round((preFeeFull * (advancePercent / 100)) * 100) / 100
-      : preFeeFull;
+    const preFeeAdvance = Math.round((preFeeFull * (advancePercent / 100)) * 100) / 100;
+    const preFeePending = Math.round((preFeeFull - preFeeAdvance) * 100) / 100;
+    const preFeeOnline = paymentType === 'advance' ? preFeeAdvance : preFeeFull;
 
     // Fetch active customer fee rule for venues
     let serviceFee = 0;
@@ -1195,9 +1194,18 @@ router.post('/calculate-price', optionalAuth, async (req, res) => {
     let showFeeAtCheckout = true;
     let feeRuleId = null;
     let feeRuleSnapshot = null;
+    let calculationBase = 'FULL';
+    let feeCalcAdv = null;
+    let feeCalcFull = null;
+
     try {
       const activeFeeRule = await billingConfig.getActiveFeeRule(turf.country_code || 'IN', turf.currency_code || 'INR', 'VENUE');
-      const feeCalc = billingConfig.calculateCustomerFee(activeFeeRule, preFeeFull, preFeeOnline);
+      calculationBase = activeFeeRule?.calculation_base || 'FULL';
+
+      feeCalcAdv = billingConfig.calculateCustomerFee(activeFeeRule, preFeeFull, preFeeAdvance);
+      feeCalcFull = billingConfig.calculateCustomerFee(activeFeeRule, preFeeFull, preFeeFull);
+
+      const feeCalc = paymentType === 'advance' ? feeCalcAdv : feeCalcFull;
       serviceFee = feeCalc.serviceFee;
       serviceFeeTax = feeCalc.serviceFeeTax;
       showFeeAtCheckout = feeCalc.showFeeAtCheckout;
@@ -1207,14 +1215,15 @@ router.post('/calculate-price', optionalAuth, async (req, res) => {
       console.error('[Bookings] Error calculating customer fee in calculate-price:', feeErr);
     }
 
-    let finalAmount = Math.max(0, baseForHost + serviceFee + serviceFeeTax);
+    const advanceFeeTotal = feeCalcAdv ? Math.round((feeCalcAdv.serviceFee + feeCalcAdv.serviceFeeTax) * 100) / 100 : 0;
+    const fullFeeTotal = feeCalcFull ? Math.round((feeCalcFull.serviceFee + feeCalcFull.serviceFeeTax) * 100) / 100 : 0;
 
-    const advanceAmount = paymentType === 'advance'
-      ? Math.round((baseForHost * (advancePercent / 100) + serviceFee + serviceFeeTax) * 100) / 100
-      : finalAmount;
-    const pendingBalance = paymentType === 'advance'
-      ? Math.round((finalAmount - advanceAmount) * 100) / 100
-      : 0;
+    const advancePayable = Math.round((preFeeAdvance + advanceFeeTotal) * 100) / 100;
+    const fullPayable = Math.round((preFeeFull + fullFeeTotal) * 100) / 100;
+
+    const advanceAmount = paymentType === 'advance' ? advancePayable : fullPayable;
+    const pendingBalance = paymentType === 'advance' ? preFeePending : 0;
+    const finalAmount = paymentType === 'advance' ? Math.round((advanceAmount + pendingBalance) * 100) / 100 : fullPayable;
 
     res.json({
       basePrice: totalBasePrice,
@@ -1226,6 +1235,16 @@ router.post('/calculate-price', optionalAuth, async (req, res) => {
       totalCustomerFee: Math.round((serviceFee + serviceFeeTax) * 100) / 100,
       showFeeAtCheckout,
       feeRuleId,
+      calculationBase,
+      // Full vs Advance breakdowns so the frontend updates instantly and synchronously
+      advanceFee: feeCalcAdv ? feeCalcAdv.serviceFee : serviceFee,
+      advanceFeeTax: feeCalcAdv ? feeCalcAdv.serviceFeeTax : serviceFeeTax,
+      advanceTotalCustomerFee: advanceFeeTotal,
+      advancePayableAmount: advancePayable,
+      fullFee: feeCalcFull ? feeCalcFull.serviceFee : serviceFee,
+      fullFeeTax: feeCalcFull ? feeCalcFull.serviceFeeTax : serviceFeeTax,
+      fullTotalCustomerFee: fullFeeTotal,
+      fullPayableAmount: fullPayable,
       finalAmount,                      // host's payable amount (after coupon + split + customer fee + tax)
       originalFinalAmount: priceAfterCoupon, // full slot cost after coupon (before split)
       contributionAmount: perPlayerContrib,  // per player contribution share
