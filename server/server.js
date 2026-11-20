@@ -462,6 +462,24 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
+// Automated cleanup of unpaid pending bookings (runs every 2 minutes)
+// Safely frees slots if checkout is abandoned, while protecting active payments
+setInterval(async () => {
+  try {
+    const [expired] = await pool.query(
+      `UPDATE bookings 
+       SET status = 'cancelled', payment_status = 'expired', cancel_reason = 'timeout_expired', cancelled_at = NOW() 
+       WHERE status = 'pending' AND payment_status = 'pending' 
+         AND created_at < NOW() - INTERVAL 5 MINUTE`
+    );
+    if (expired && expired.affectedRows > 0) {
+      console.log(`[AutoCleanup] Safely released ${expired.affectedRows} stale pending booking(s) older than 5m.`);
+    }
+  } catch (err) {
+    console.error('[AutoCleanup] Failed to clean up stale pending bookings:', err.message);
+  }
+}, 2 * 60 * 1000);
+
 app.listen(PORT, () => {
   console.log(`\n🏟️  Book Arena API Server`);
   console.log(`📡 Running on http://localhost:${PORT}`);

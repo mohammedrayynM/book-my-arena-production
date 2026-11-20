@@ -2240,11 +2240,11 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
   }
 });
 
-// POST /api/bookings/cleanup-pending - Clean up expired pending bookings (call this every 15 mins via cron)
+// POST /api/bookings/cleanup-pending - Clean up expired pending bookings
 router.post('/cleanup-pending', async (req, res) => {
   try {
     const [expiredCandidates] = await pool.query(
-      "SELECT id, razorpay_order_id FROM bookings WHERE status = 'pending' AND payment_status = 'pending' AND created_at < NOW() - INTERVAL 15 MINUTE"
+      "SELECT id, razorpay_order_id FROM bookings WHERE status = 'pending' AND payment_status = 'pending' AND created_at < NOW() - INTERVAL 5 MINUTE"
     );
     const byOrder = new Map();
     const noOrderIds = [];
@@ -2277,7 +2277,7 @@ router.post('/cleanup-pending', async (req, res) => {
       const [result] = await pool.query(
         `UPDATE bookings SET status = 'cancelled', payment_status = 'expired'
          WHERE id IN (${placeholders}) AND status = 'pending' AND payment_status = 'pending'
-           AND created_at < NOW() - INTERVAL 15 MINUTE`,
+           AND created_at < NOW() - INTERVAL 5 MINUTE`,
         safeToExpire
       );
       expired = result.affectedRows;

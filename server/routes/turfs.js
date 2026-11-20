@@ -535,7 +535,7 @@ router.get('/:idOrSlug/slots', async (req, res) => {
       AND (
         (payment_status = 'success' AND status != 'cancelled')
         OR
-        (payment_status = 'pending' AND status = 'pending' AND created_at > NOW() - INTERVAL 15 MINUTE)
+        (payment_status = 'pending' AND status = 'pending' AND created_at > NOW() - INTERVAL 5 MINUTE)
       )
     `;
     const bookedParams = [turfId, date];

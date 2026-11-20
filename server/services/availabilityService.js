@@ -48,7 +48,7 @@ async function checkSingleSlotAvailability({ turfId, courtId = null, date, timeS
     AND (
       (payment_status = 'success' AND status != 'cancelled')
       ${paidOnly ? '' : `OR
-      (payment_status = 'pending' AND status = 'pending' AND created_at > NOW() - INTERVAL 15 MINUTE)`}
+      (payment_status = 'pending' AND status = 'pending' AND created_at > NOW() - INTERVAL 5 MINUTE)`}
     )
   `;
   const bookingParams = [normalizedTurfId, date];
